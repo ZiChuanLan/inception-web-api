@@ -103,7 +103,10 @@ class BrowserBridgeEngine:
         asyncio.set_event_loop(self.loop)
         try:
             self.loop.run_until_complete(self._bootstrap())
-        except Exception:
+        except Exception as e:
+            import traceback
+            print(f"[!] Browser engine bootstrap error: {e}")
+            traceback.print_exc()
             self.failed = True
         if not self.failed:
             self.loop.run_forever()
@@ -185,7 +188,7 @@ class BrowserBridgeEngine:
                 }).then(async (r) => {
                     if (!r.ok) {
                         const err = await r.text();
-                        window.py_on_done(reqId, r.status, err);
+                        await window.py_on_done(reqId, r.status, err);
                         return;
                     }
                     const reader = r.body.getReader();
@@ -193,11 +196,11 @@ class BrowserBridgeEngine:
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) break;
-                        window.py_on_chunk(reqId, decoder.decode(value, { stream: true }));
+                        await window.py_on_chunk(reqId, decoder.decode(value, { stream: true }));
                     }
-                    window.py_on_done(reqId, 200, '');
-                }).catch(e => {
-                    window.py_on_done(reqId, 500, e.toString());
+                    await window.py_on_done(reqId, 200, '');
+                }).catch(async (e) => {
+                    await window.py_on_done(reqId, 500, e.toString());
                 });
             };
         }""")
@@ -296,8 +299,8 @@ class BrowserBridgeEngine:
                         event_block, buffer = buffer.split("\n\n", 1)
                         for line in event_block.split("\n"):
                             line = line.strip()
-                            if line.startswith("data: "):
-                                raw_data = line[6:].strip()
+                            if line.startswith("data:"):
+                                raw_data = line[5:].strip()
                                 if raw_data == "[DONE]":
                                     return
                                 try:
@@ -319,6 +322,26 @@ class BrowserBridgeEngine:
                     err = item[2]
                     if status != 200:
                         raise RuntimeError(f"Inception Chat returned HTTP {status}: {err}")
+                    if buffer.strip():
+                        for line in buffer.split("\n"):
+                            line = line.strip()
+                            if line.startswith("data:"):
+                                raw_data = line[5:].strip()
+                                if raw_data != "[DONE]":
+                                    try:
+                                        ev = json.loads(raw_data)
+                                        ev_type = ev.get("type")
+                                        if ev_type == "text-delta":
+                                            yield ("text", ev.get("delta", ""))
+                                        elif ev_type == "reasoning-delta":
+                                            yield ("reasoning", ev.get("delta", ""))
+                                        elif ev_type == "source-url":
+                                            url = ev.get("url", "")
+                                            title = ev.get("title", "")
+                                            if url and url != "__searching__":
+                                                yield ("citation", {"url": url, "title": title})
+                                    except Exception:
+                                        pass
                     break
         finally:
             self.active_queues.pop(req_id, None)
@@ -358,7 +381,7 @@ class CurlEngine:
             self.token_expire_time = now + 600
         return self.token
 
-    def chat_events(self, messages, reasoning_effort="medium", web_search=False):
+    async def chat_events(self, messages, reasoning_effort="medium", web_search=False):
         token = self.get_token()
         chat_id = "chat_" + uuid.uuid4().hex[:12]
         msg_id = "msg_" + uuid.uuid4().hex[:12]
