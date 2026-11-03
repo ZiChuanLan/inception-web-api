@@ -7,7 +7,7 @@
 
 An OpenAI-compatible **API Gateway** for Inception Labs Mercury 3 (Diffusion LLM).
 
-基于 `chat.inceptionlabs.ai` Web 协议逆向实现的 **OpenAI 兼容反向代理服务**。支持 Docker 双引擎架构一键切换、4 档思考深度与实时联网搜索。
+基于 `chat.inceptionlabs.ai` Web 协议实现的 **OpenAI 兼容反向代理服务**。支持 Docker 双引擎架构一键切换、4 档思考深度与实时联网搜索。
 
 ---
 
