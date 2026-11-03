@@ -15,6 +15,7 @@ Features:
 
 import os
 import sys
+import re
 import time
 import uuid
 import json
@@ -498,6 +499,205 @@ async def health():
     }
 
 
+# ---------------------------------------------------------------------------
+# Tool Emulation Helpers (Function Calling virtualization)
+# ---------------------------------------------------------------------------
+def parse_tool_definitions(
+    tools: Optional[List[Dict[str, Any]]],
+    functions: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Normalizes OpenAI tools/functions definitions into a unified format."""
+    tool_defs = []
+    valid_names = []
+
+    if tools:
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            if t.get("type") == "function" and "function" in t:
+                fn = t["function"]
+                if isinstance(fn, dict):
+                    tool_defs.append(fn)
+                    if "name" in fn and isinstance(fn["name"], str):
+                        valid_names.append(fn["name"])
+            elif "name" in t and isinstance(t["name"], str):
+                tool_defs.append(t)
+                valid_names.append(t["name"])
+    elif functions:
+        for fn in functions:
+            if isinstance(fn, dict) and "name" in fn and isinstance(fn["name"], str):
+                tool_defs.append(fn)
+                valid_names.append(fn["name"])
+
+    return tool_defs, valid_names
+
+
+def build_tool_system_prompt(tool_defs: List[Dict[str, Any]], tool_choice: Any = "auto") -> str:
+    """Builds a strict, unambiguous system prompt instructing the model how to call tools."""
+    tools_json = json.dumps(tool_defs, ensure_ascii=False, indent=2)
+    prompt = [
+        "## Tools and Functions",
+        "You have access to the following functions to assist the user:",
+        "```json",
+        tools_json,
+        "```",
+        "",
+        "## Tool Call Protocol",
+        "If you decide to invoke any of the listed functions, you MUST output your response in the following JSON format enclosed in a ```json code block.",
+        'Each call must be an object with "name" (the function name) and "arguments" (a key-value dictionary of arguments conforming to the function\'s parameters):',
+        "```json",
+        "{",
+        '  "name": "function_name",',
+        '  "arguments": {',
+        '    "param_name": "value"',
+        "  }",
+        "}",
+        "```",
+        "If multiple tool calls are needed, you may output a JSON array of such objects:",
+        "```json",
+        "[",
+        '  {"name": "func_1", "arguments": {...}},',
+        '  {"name": "func_2", "arguments": {...}}',
+        "]",
+        "```",
+        "STRICT RULES:",
+        "1. When calling a tool, output ONLY the ```json ... ``` code block. Do NOT include conversational filler, greetings, or explanations before or after the code block.",
+        '2. The "arguments" MUST be a valid JSON dictionary matching the schema.',
+        "3. If no function needs to be called, answer normally with plain natural language. Do NOT output a tool call JSON.",
+    ]
+
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        target = tool_choice.get("function", {}).get("name")
+        if target:
+            prompt.append(f"4. You are REQUIRED to call the function '{target}'.")
+    elif tool_choice == "required":
+        prompt.append("4. You are REQUIRED to call at least one of the available functions.")
+
+    return "\n".join(prompt)
+
+
+def prepare_messages_for_tools(
+    messages: List[Dict[str, Any]],
+    tool_prompt: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Transforms chat messages to flatten tool calls/results into upstream-compatible text."""
+    transformed = []
+    system_injected = False
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        tool_calls = m.get("tool_calls")
+
+        # 1. Flatten assistant tool_calls into readable text if present
+        if role == "assistant" and tool_calls:
+            calls_summary = []
+            for tc in tool_calls:
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                fname = fn.get("name", "unknown")
+                fargs = fn.get("arguments", "{}")
+                calls_summary.append(f"Calling tool `{fname}` with arguments: {fargs}")
+            summary_str = "\n".join(calls_summary)
+            if content:
+                content = f"{content}\n{summary_str}"
+            else:
+                content = summary_str
+
+        # 2. Flatten tool/function results into user messages
+        elif role in ("tool", "function"):
+            tool_id = m.get("tool_call_id") or m.get("name") or "tool"
+            role = "user"
+            content = f"[Tool Execution Result for `{tool_id}`]:\n{content}"
+
+        # 3. Inject tool prompt into system message if available
+        elif role == "system" and tool_prompt and not system_injected:
+            content = f"{content}\n\n{tool_prompt}" if content else tool_prompt
+            system_injected = True
+
+        transformed.append({"role": role, "content": content})
+
+    # If no existing system message was found, prepend one
+    if tool_prompt and not system_injected:
+        transformed.insert(0, {"role": "system", "content": tool_prompt})
+
+    return transformed
+
+
+def extract_tool_calls(
+    text: str,
+    valid_tool_names: List[str]
+) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """Extracts JSON tool calls matching valid_tool_names from model output text.
+    Returns: (tool_calls_list or None, remaining_text)
+    """
+    if not text or not valid_tool_names:
+        return None, text
+
+    valid_names_lower = {name.lower(): name for name in valid_tool_names}
+    candidates = []
+
+    # 1. Search for markdown code blocks (```json ... ``` or ``` ... ```)
+    code_block_pattern = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+    for match in code_block_pattern.finditer(text):
+        snippet = match.group(1).strip()
+        candidates.append((snippet, match.span()))
+
+    # 2. Search for raw JSON objects or arrays if not in a code block
+    if not candidates:
+        stripped = text.strip()
+        if (stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]")):
+            candidates.append((stripped, (0, len(text))))
+        else:
+            json_obj_pattern = re.search(r"(\{\s*\"name\"\s*:\s*\"[^\"]+\"[\s\S]*?\})", text)
+            if json_obj_pattern:
+                candidates.append((json_obj_pattern.group(1).strip(), json_obj_pattern.span()))
+
+    for snippet, span in candidates:
+        try:
+            parsed = json.loads(snippet)
+        except Exception:
+            continue
+
+        items = parsed if isinstance(parsed, list) else [parsed]
+        tool_calls = []
+
+        for item in items:
+            if isinstance(item, dict) and "name" in item:
+                raw_name = str(item["name"]).strip()
+                matched_name = valid_names_lower.get(raw_name.lower())
+                if matched_name:
+                    args = item.get("arguments", {})
+                    if isinstance(args, (dict, list)):
+                        args_str = json.dumps(args, ensure_ascii=False)
+                    elif isinstance(args, str):
+                        try:
+                            json.loads(args)
+                            args_str = args
+                        except Exception:
+                            args_str = json.dumps(args, ensure_ascii=False)
+                    else:
+                        args_str = json.dumps(str(args), ensure_ascii=False)
+
+                    call_id = "call_" + uuid.uuid4().hex[:16]
+                    tool_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": matched_name,
+                            "arguments": args_str,
+                        }
+                    })
+
+        if tool_calls:
+            start, end = span
+            remaining = (text[:start] + text[end:]).strip()
+            return tool_calls, remaining
+
+    return None, text
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     auth = request.headers.get("authorization")
@@ -531,6 +731,16 @@ async def chat_completions(request: Request):
     model = body.get("model", DEFAULT_MODEL)
     stream = body.get("stream", False)
 
+    tools = body.get("tools")
+    functions = body.get("functions")
+    tool_choice = body.get("tool_choice", "auto")
+
+    # Tool Emulation detection
+    tool_defs, valid_tool_names = parse_tool_definitions(tools, functions)
+    has_tools = bool(tool_defs) and tool_choice != "none"
+    tool_prompt = build_tool_system_prompt(tool_defs, tool_choice) if has_tools else None
+    effective_messages = prepare_messages_for_tools(messages, tool_prompt=tool_prompt)
+
     requested_effort = body.get("reasoning_effort") or body.get("reasoning")
     if not requested_effort:
         if "instant" in model:
@@ -548,10 +758,11 @@ async def chat_completions(request: Request):
     req_id = "chatcmpl-" + uuid.uuid4().hex[:16]
     created = current_timestamp()
 
-    async def event_generator():
+    # Generator for raw real-time streaming when no tools are requested
+    async def real_time_stream_generator():
         try:
             async for kind, val in engine.chat_events(
-                messages,
+                effective_messages,
                 reasoning_effort=reasoning_effort,
                 web_search=web_search,
             ):
@@ -589,17 +800,127 @@ async def chat_completions(request: Request):
         yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
+    # Generator for tool-emulated streaming
+    async def tool_stream_generator():
+        full_text = []
+        full_reasoning = []
+        citations = []
+        try:
+            async for kind, val in engine.chat_events(
+                effective_messages,
+                reasoning_effort=reasoning_effort,
+                web_search=web_search,
+            ):
+                if kind == "text":
+                    full_text.append(val)
+                elif kind == "reasoning":
+                    full_reasoning.append(val)
+                elif kind == "citation":
+                    citations.append(val)
+        except Exception as e:
+            err_chunk = {"error": str(e)}
+            yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+            return
+
+        # Check for tool call in output
+        merged_text = "".join(full_text)
+        tool_calls, remaining_content = extract_tool_calls(merged_text, valid_tool_names)
+
+        # 1. Output reasoning content first if present
+        if full_reasoning:
+            merged_reasoning = "".join(full_reasoning)
+            chunk = {
+                "id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": merged_reasoning}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        else:
+            role_chunk = {
+                "id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+
+        # 2. Output citations if present
+        for cit in citations:
+            chunk = {
+                "id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"citation": cit}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        if tool_calls:
+            if remaining_content:
+                chunk = {
+                    "id": req_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": remaining_content}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+            delta_tool_calls = [
+                {
+                    "index": idx,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    }
+                }
+                for idx, tc in enumerate(tool_calls)
+            ]
+            tc_chunk = {
+                "id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"tool_calls": delta_tool_calls}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n"
+
+            end_chunk = {
+                "id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            }
+            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+        else:
+            # Normal plain text output - stream in chunks
+            step = 30
+            for i in range(0, len(merged_text), step):
+                sub_text = merged_text[i:i + step]
+                chunk = {
+                    "id": req_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": sub_text}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+            end_chunk = {
+                "id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+
+        yield "data: [DONE]\n\n"
+
     if stream:
-        first_chunk = {
-            "id": req_id, "object": "chat.completion.chunk",
-            "created": created, "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
-        }
-        async def combined_generator():
-            yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
-            async for item in event_generator():
-                yield item
-        return StreamingResponse(combined_generator(), media_type="text/event-stream")
+        if has_tools:
+            return StreamingResponse(tool_stream_generator(), media_type="text/event-stream")
+        else:
+            first_chunk = {
+                "id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+            }
+            async def combined_generator():
+                yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
+                async for item in real_time_stream_generator():
+                    yield item
+            return StreamingResponse(combined_generator(), media_type="text/event-stream")
 
     else:
         full_text = []
@@ -607,7 +928,7 @@ async def chat_completions(request: Request):
         citations = []
         try:
             async for kind, val in engine.chat_events(
-                messages,
+                effective_messages,
                 reasoning_effort=reasoning_effort,
                 web_search=web_search,
             ):
@@ -620,7 +941,24 @@ async def chat_completions(request: Request):
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Upstream chat error: {str(e)}")
 
-        msg_payload = {"role": "assistant", "content": "".join(full_text)}
+        merged_text = "".join(full_text)
+        tool_calls = None
+        finish_reason = "stop"
+
+        if has_tools:
+            tool_calls, remaining_content = extract_tool_calls(merged_text, valid_tool_names)
+            if tool_calls:
+                finish_reason = "tool_calls"
+                msg_payload = {
+                    "role": "assistant",
+                    "content": remaining_content or None,
+                    "tool_calls": tool_calls,
+                }
+            else:
+                msg_payload = {"role": "assistant", "content": merged_text}
+        else:
+            msg_payload = {"role": "assistant", "content": merged_text}
+
         if full_reasoning:
             msg_payload["reasoning_content"] = "".join(full_reasoning)
         if citations:
@@ -635,13 +973,13 @@ async def chat_completions(request: Request):
                 {
                     "index": 0,
                     "message": msg_payload,
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {
                 "prompt_tokens": len(str(messages)),
-                "completion_tokens": len("".join(full_text)),
-                "total_tokens": len(str(messages)) + len("".join(full_text)),
+                "completion_tokens": len(merged_text),
+                "total_tokens": len(str(messages)) + len(merged_text),
             },
         }
 

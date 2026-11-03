@@ -40,6 +40,7 @@ An OpenAI-compatible **API Gateway** for Inception Labs Mercury 3 (Diffusion LLM
   - 完美适配 OpenAI `reasoning_effort` 与 DeepSeek R1 规范的 `reasoning_content`。
 - **🌐 实时联网搜索 (Live Web Search)**：原生支持开启网络搜索，自动捕获并返回来源引用（`citations`）。
 - **⚡ 双模传输全兼容**：标准 SSE 流式直出（`stream=true`）与非流式聚合返回（`stream=false`）完全一致。
+- **🛠️ 工具调用与函数执行支持 (Tool / Function Calling Emulation)**：内置网关层双向协议虚拟化转译，完整兼容 OpenAI `tools`、`functions`、`tool_choice`，支持 Agent 循环与多轮工具调用，无缝对接 Dify、Cherry Studio、LangChain 等框架。
 - **🔌 即插即用生态**：无缝接入 OneAPI / NewAPI / NextChat / OpenAI SDK / Dify / 沉浸式翻译等生态。
 
 ---
@@ -185,6 +186,35 @@ response = client.chat.completions.create(
 print("回答:", response.choices[0].message.content)
 if hasattr(response.choices[0].message, "reasoning_content"):
     print("思考过程:", response.choices[0].message.reasoning_content)
+
+# 3. 工具调用与 Agent 模式 (Tool / Function Calling)
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "获取指定城市的实时天气",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名称，如北京"}
+                },
+                "required": ["city"]
+            }
+        }
+    }
+]
+
+tool_res = client.chat.completions.create(
+    model="mercury-3",
+    messages=[{"role": "user", "content": "今天北京天气怎么样？"}],
+    tools=tools,
+    tool_choice="auto"
+)
+
+if tool_res.choices[0].message.tool_calls:
+    for tc in tool_res.choices[0].message.tool_calls:
+        print("命中工具调用:", tc.function.name, "参数:", tc.function.arguments)
 ```
 
 ---
@@ -196,6 +226,7 @@ if hasattr(response.choices[0].message, "reasoning_content"):
 - ✅ **并发请求**：多路并发实测各自返回正确结果（内部按 `reqId` 隔离分发）。
 - ✅ **首字延迟**：`curl` 引擎约 300ms；`browser` 引擎约 1.2s。
 - ✅ **流式与非流式**：OpenAI SSE chunk 格式与非流式单次聚合返回均 100% 修复并跑通。
+- ✅ **Tool Calling 虚拟化转译**：`tools` / `functions` 结构解析、系统提示词自动注入、模型调用结果拦截与标准 `tool_calls` 打包全部通过 12 项回归测试。
 
 ---
 
