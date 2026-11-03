@@ -211,3 +211,7 @@ if hasattr(response.choices[0].message, "reasoning_content"):
 ## 📄 License
 
 [MIT License](LICENSE) © 2026 ZiChuanLan
+
+---
+### 友情链接
+[Linuxdo](https://linux.do)
