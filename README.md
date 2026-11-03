@@ -23,6 +23,7 @@ An OpenAI-compatible **API Gateway** for Inception Labs Mercury 3 (Diffusion LLM
   - `high`：深度逻辑推演（长思维链）
   - 完美适配 OpenAI `reasoning_effort` 与 DeepSeek R1 规范的 `reasoning_content`。
 - **🌐 实时联网搜索 (Live Web Search)**：原生支持开启网络搜索，自动捕获并返回来源引用（`citations`）。
+- **📦 精简容器架构 (Slim Footprint)**：基于 `python:3.11-slim` 定制打包，仅安装 Chromium 单个浏览器及必要 Linux 动态库（剔除 Firefox、WebKit 与音视频组件），镜像体积从官方全家桶的 **4.73GB 骤降至 ~700MB**，削减 85% 存储占用。
 - **⚡ 双模流式传输 (Full Streaming & Non-Streaming)**：标准 SSE 流式直出与一次性返回全兼容。
 - **🔄 双引擎支持**：`ENGINE=browser`（默认，最稳）或 `ENGINE=curl`（零浏览器 fallback，仅限住宅/清洁 IP）。
 - **🔌 即插即用**：无缝接入 OneAPI / NewAPI / NextChat / OpenAI SDK / Dify / 沉浸式翻译等生态。

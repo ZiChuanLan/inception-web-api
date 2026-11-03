@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -7,6 +7,10 @@ ENV PYTHONUNBUFFERED=1
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install ONLY Chromium and its minimal Linux dependencies (excludes Firefox, WebKit, ffmpeg)
+RUN playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY app.py .
 
