@@ -105,15 +105,16 @@ def normalize_upstream_messages(messages: List[Dict[str, Any]]) -> List[Dict[str
             })
             continue
 
-        # Handle assistant tool_calls
+        # Handle assistant tool_calls: render as strict json markdown block matching our protocol
         elif role == "assistant" and tool_calls:
-            calls_summary = []
+            calls_blocks = []
             for tc in tool_calls:
                 fn = tc.get("function", {}) if isinstance(tc, dict) else {}
                 fname = fn.get("name", "unknown")
                 fargs = fn.get("arguments", "{}")
-                calls_summary.append(f"Calling tool `{fname}` with arguments: {fargs}")
-            summary_str = "\n".join(calls_summary)
+                # Format as json code block for consistent in-context learning
+                calls_blocks.append(f"```json\n{{\"name\": \"{fname}\", \"arguments\": {fargs}}}\n```")
+            summary_str = "\n".join(calls_blocks)
             if content:
                 content = f"{content}\n{summary_str}"
             else:
@@ -605,10 +606,98 @@ def parse_tool_definitions(
     return tool_defs, valid_names
 
 
+def extract_balanced_json(s: str, start_index: int = 0) -> Optional[Tuple[str, int, int]]:
+    """
+    Finds the first balanced {...} or [...] starting at or after start_index.
+    Handles quotes and escaping correctly.
+    Returns: (json_str, start_pos, end_pos) or None
+    """
+    first_brace = -1
+    open_char = None
+    close_char = None
+
+    for i in range(start_index, len(s)):
+        if s[i] == '{':
+            first_brace = i
+            open_char = '{'
+            close_char = '}'
+            break
+        elif s[i] == '[':
+            first_brace = i
+            open_char = '['
+            close_char = ']'
+            break
+
+    if first_brace == -1:
+        return None
+
+    count = 0
+    in_string = False
+    escape = False
+
+    for i in range(first_brace, len(s)):
+        ch = s[i]
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if ch == open_char:
+                count += 1
+            elif ch == close_char:
+                count -= 1
+                if count == 0:
+                    return s[first_brace:i+1], first_brace, i+1
+
+    return None
+
+
+def compact_tool_definitions(tool_defs: List[Dict[str, Any]], max_tools: int = 50) -> List[Dict[str, Any]]:
+    """
+    Compacts tool definitions to keep prompt size manageable:
+    - Truncates verbose descriptions (> 100 chars).
+    - Compacts nested property definitions (> 50 chars).
+    - Caps tool count to prevent prompt explosion in multi-tool agent environments.
+    """
+    compacted = []
+    for td in tool_defs[:max_tools]:
+        c = {"name": td.get("name", "")}
+        desc = td.get("description", "")
+        if desc:
+            c["description"] = (desc[:100] + "...") if len(desc) > 100 else desc
+
+        params = td.get("parameters")
+        if isinstance(params, dict):
+            clean_params = {"type": params.get("type", "object")}
+            if "properties" in params and isinstance(params["properties"], dict):
+                clean_props = {}
+                for k, v in params["properties"].items():
+                    if isinstance(v, dict):
+                        p_desc = v.get("description", "")
+                        clean_props[k] = {"type": v.get("type", "string")}
+                        if p_desc:
+                            clean_props[k]["description"] = (p_desc[:50] + "...") if len(p_desc) > 50 else p_desc
+                        if "enum" in v:
+                            clean_props[k]["enum"] = v["enum"]
+                    else:
+                        clean_props[k] = v
+                clean_params["properties"] = clean_props
+            if "required" in params:
+                clean_params["required"] = params["required"]
+            c["parameters"] = clean_params
+        compacted.append(c)
+    return compacted
+
+
 def build_tool_system_prompt(tool_defs: List[Dict[str, Any]], tool_choice: Any = "auto") -> str:
     """Builds a compact, unambiguous system prompt instructing the model how to call tools."""
-    # Compact JSON serialization to prevent token bloat
-    tools_json = json.dumps(tool_defs, ensure_ascii=False, separators=(',', ':'))
+    compacted_defs = compact_tool_definitions(tool_defs)
+    tools_json = json.dumps(compacted_defs, ensure_ascii=False, separators=(',', ':'))
     prompt = [
         "## Tools",
         f"You have access to the following functions:\n```json\n{tools_json}\n```",
@@ -618,9 +707,9 @@ def build_tool_system_prompt(tool_defs: List[Dict[str, Any]], tool_choice: Any =
         "```json",
         '{"name": "function_name", "arguments": {"param": "value"}}',
         "```",
-        "STRICT RULES:",
-        "1. Output ONLY the ```json ... ``` code block. Do NOT include conversational filler, greetings, or explanations before or after the code block.",
-        '2. The "arguments" MUST be a valid JSON dictionary matching the function schema.',
+        "CRITICAL RULES:",
+        "1. To invoke a tool, output the ```json ... ``` code block. Do NOT merely say 'Calling tool...' as plain text without emitting the executable call.",
+        '2. The "arguments" MUST be a valid JSON dictionary conforming to the parameters schema.',
         "3. If no function needs to be called, answer normally with plain natural language. Do NOT output a tool call JSON.",
     ]
 
@@ -649,32 +738,61 @@ def extract_tool_calls(
     text: str,
     valid_tool_names: List[str]
 ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
-    """Extracts JSON tool calls matching valid_tool_names from model output text.
+    """Extracts tool calls from model output with multi-pattern tolerance:
+    1. Natural calling syntax (e.g. Calling tool `todo` with arguments: {...})
+    2. Action / Tool Call syntax (e.g. Tool Call: todo Arguments: {...})
+    3. Markdown ```json ... ``` code blocks
+    4. Raw balanced JSON blocks containing {"name": "..."}
     Returns: (tool_calls_list or None, remaining_text)
     """
     if not text or not valid_tool_names:
         return None, text
 
     valid_names_lower = {name.lower(): name for name in valid_tool_names}
-    candidates = []
 
-    # 1. Search for markdown code blocks (```json ... ``` or ``` ... ```)
+    # -----------------------------------------------------------------------
+    # Pattern 1: Natural Calling syntax (e.g. Calling tool `todo` with arguments: {...})
+    # -----------------------------------------------------------------------
+    calling_patterns = [
+        re.compile(r"Calling\s+tool\s+[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+with\s+arguments:\s*", re.IGNORECASE),
+        re.compile(r"(?:Tool\s+Call|Action):\s*[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s*(?:Arguments|Action\s+Input):\s*", re.IGNORECASE),
+        re.compile(r"Calling\s+(?:tool\s+)?[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s*\(?\s*arguments:\s*", re.IGNORECASE),
+    ]
+
+    for pat in calling_patterns:
+        m = pat.search(text)
+        if m:
+            raw_tool_name = m.group(1).strip()
+            matched_name = valid_names_lower.get(raw_tool_name.lower())
+            if matched_name:
+                balanced = extract_balanced_json(text, m.end())
+                if balanced:
+                    args_str, b_start, b_end = balanced
+                    try:
+                        parsed_args = json.loads(args_str)
+                        final_args = json.dumps(parsed_args, ensure_ascii=False) if isinstance(parsed_args, dict) else args_str
+                    except Exception:
+                        final_args = args_str
+
+                    call_id = "call_" + uuid.uuid4().hex[:16]
+                    tool_calls = [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": matched_name,
+                            "arguments": final_args,
+                        }
+                    }]
+                    # Keep conversational prefix before "Calling tool..." as remaining text
+                    remaining = (text[:m.start()] + text[b_end:]).strip()
+                    return tool_calls, remaining
+
+    # -----------------------------------------------------------------------
+    # Pattern 2: Markdown code blocks (```json ... ``` or ``` ... ```)
+    # -----------------------------------------------------------------------
     code_block_pattern = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
     for match in code_block_pattern.finditer(text):
         snippet = match.group(1).strip()
-        candidates.append((snippet, match.span()))
-
-    # 2. Search for raw JSON objects or arrays if not in a code block
-    if not candidates:
-        stripped = text.strip()
-        if (stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]")):
-            candidates.append((stripped, (0, len(text))))
-        else:
-            json_obj_pattern = re.search(r"(\{\s*\"name\"\s*:\s*\"[^\"]+\"[\s\S]*?\})", text)
-            if json_obj_pattern:
-                candidates.append((json_obj_pattern.group(1).strip(), json_obj_pattern.span()))
-
-    for snippet, span in candidates:
         try:
             parsed = json.loads(snippet)
         except Exception:
@@ -711,8 +829,57 @@ def extract_tool_calls(
                     })
 
         if tool_calls:
-            start, end = span
+            start, end = match.span()
             remaining = (text[:start] + text[end:]).strip()
+            return tool_calls, remaining
+
+    # -----------------------------------------------------------------------
+    # Pattern 3: Raw balanced JSON blocks containing {"name": ...}
+    # -----------------------------------------------------------------------
+    pos = 0
+    while pos < len(text):
+        balanced = extract_balanced_json(text, pos)
+        if not balanced:
+            break
+        json_str, b_start, b_end = balanced
+        pos = b_end
+        try:
+            parsed = json.loads(json_str)
+        except Exception:
+            continue
+
+        items = parsed if isinstance(parsed, list) else [parsed]
+        tool_calls = []
+
+        for item in items:
+            if isinstance(item, dict) and "name" in item:
+                raw_name = str(item["name"]).strip()
+                matched_name = valid_names_lower.get(raw_name.lower())
+                if matched_name:
+                    args = item.get("arguments", {})
+                    if isinstance(args, (dict, list)):
+                        args_str = json.dumps(args, ensure_ascii=False)
+                    elif isinstance(args, str):
+                        try:
+                            json.loads(args)
+                            args_str = args
+                        except Exception:
+                            args_str = json.dumps(args, ensure_ascii=False)
+                    else:
+                        args_str = json.dumps(str(args), ensure_ascii=False)
+
+                    call_id = "call_" + uuid.uuid4().hex[:16]
+                    tool_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": matched_name,
+                            "arguments": args_str,
+                        }
+                    })
+
+        if tool_calls:
+            remaining = (text[:b_start] + text[b_end:]).strip()
             return tool_calls, remaining
 
     return None, text

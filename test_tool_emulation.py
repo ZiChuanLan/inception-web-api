@@ -129,8 +129,8 @@ class TestToolEmulation(unittest.TestCase):
         self.assertIn("Additional tool schema", first_user["content"])
         self.assertIn("Write a python script.", first_user["content"])
 
-        # 3. Assistant tool calls flattened
-        self.assertIn("Calling tool `bash`", norm[1]["content"])
+        # 3. Assistant tool calls formatted as JSON block for consistent in-context learning
+        self.assertIn('"name": "bash"', norm[1]["content"])
 
         # 4. Tool result flattened to user
         self.assertEqual(norm[2]["role"], "user")
@@ -194,6 +194,56 @@ class TestToolEmulation(unittest.TestCase):
         self.assertEqual(len(tool_calls), 2)
         self.assertEqual(tool_calls[0]["function"]["name"], "get_weather")
         self.assertEqual(tool_calls[1]["function"]["name"], "get_weather")
+
+    def test_extract_tool_calls_user_reported_case(self):
+        # Exact reproduction of user issue: natural calling text + prefix
+        text = """✅ `todo` 正常（#1-#6 已创建）。
+
+开始任务 #1，标记为进行中：
+Calling tool `todo` with arguments: {"action":"update","id":1,"status":"in_progress","activeForm":"测试基础工具"}"""
+
+        tool_calls, remaining = extract_tool_calls(text, ["todo", "bash"])
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["function"]["name"], "todo")
+        args = json.loads(tool_calls[0]["function"]["arguments"])
+        self.assertEqual(args["action"], "update")
+        self.assertEqual(args["id"], 1)
+        self.assertEqual(args["status"], "in_progress")
+        self.assertIn("✅ `todo` 正常", remaining)
+        self.assertIn("开始任务 #1，标记为进行中：", remaining)
+
+    def test_extract_tool_calls_action_format(self):
+        text = """Action: bash
+Action Input: {"command": "ls -la"}"""
+        tool_calls, remaining = extract_tool_calls(text, ["bash"])
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["function"]["name"], "bash")
+        args = json.loads(tool_calls[0]["function"]["arguments"])
+        self.assertEqual(args["command"], "ls -la")
+
+    def test_compact_tool_definitions(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"tool_{i}",
+                    "description": "Very long description " * 20,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            f"arg_{j}": {"type": "string", "description": "arg desc " * 20}
+                            for j in range(5)
+                        }
+                    }
+                }
+            }
+            for i in range(70)
+        ]
+        tool_defs, valid_names = parse_tool_definitions(tools)
+        prompt = build_tool_system_prompt(tool_defs)
+        self.assertLess(len(prompt), 35000)
 
     def test_extract_tool_calls_no_match(self):
         text = "Hello! Tokyo is a great city. No tools needed."
