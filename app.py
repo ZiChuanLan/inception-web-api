@@ -43,6 +43,8 @@ try:
 except ValueError:
     POOL_SIZE = 5
 
+DEFAULT_REASONING_EFFORT = os.getenv("DEFAULT_REASONING_EFFORT", "medium").strip().lower()
+
 app = FastAPI(
     title="Inception Mercury Web-to-API",
     description="Headless browser bridge with OpenAI-compatible API for Inception Mercury 3",
@@ -349,23 +351,27 @@ class BrowserBridgeEngine:
 
             needed = self.pool_size - len(self.token_pool)
             if needed > 0:
-                fetch_count = min(needed, 3)
-                for _ in range(fetch_count):
-                    try:
-                        res = await self._page.evaluate("""async () => {
+                fetch_count = min(needed, self.pool_size)
+                try:
+                    results = await self._page.evaluate("""async (count) => {
+                        const promises = Array.from({length: count}, async () => {
                             try {
                                 const r = await fetch('/api/session');
                                 return { status: r.status, data: await r.json() };
                             } catch (e) {
                                 return { err: e.toString() };
                             }
-                        }""")
-                        if res.get("status") == 200 and res.get("data", {}).get("ok"):
-                            tok = res["data"]["token"]
-                            self.token_pool.append((tok, now + 600))
-                            print(f"[Bridge] Pooled token added ({len(self.token_pool)}/{self.pool_size}): {tok[:18]}...")
-                    except Exception as e:
-                        print(f"[Bridge] Failed to fetch pooled token: {e}")
+                        });
+                        return await Promise.all(promises);
+                    }""", fetch_count)
+                    if isinstance(results, list):
+                        for res in results:
+                            if res.get("status") == 200 and res.get("data", {}).get("ok"):
+                                tok = res["data"]["token"]
+                                self.token_pool.append((tok, now + 600))
+                                print(f"[Bridge] Pooled token added ({len(self.token_pool)}/{self.pool_size}): {tok[:18]}...")
+                except Exception as e:
+                    print(f"[Bridge] Error in parallel token fetch: {e}")
 
             if not self.token_pool:
                 res = await self._page.evaluate("""async () => {
@@ -381,6 +387,29 @@ class BrowserBridgeEngine:
             self._rr_index = (self._rr_index + 1) % len(self.token_pool)
             token, _ = self.token_pool[self._rr_index]
             return token
+
+    async def close(self):
+        print("[Bridge] Closing headless browser bridge...")
+        if self.loop and self._page:
+            try:
+                fut = self._submit(self._page.close())
+                await asyncio.wrap_future(fut)
+            except Exception:
+                pass
+        if self.loop and self._browser:
+            try:
+                fut = self._submit(self._browser.close())
+                await asyncio.wrap_future(fut)
+            except Exception:
+                pass
+        if self.loop and self._playwright:
+            try:
+                fut = self._submit(self._playwright.stop())
+                await asyncio.wrap_future(fut)
+            except Exception:
+                pass
+        if self.loop:
+            self.loop.call_soon_threadsafe(self.loop.stop)
 
     async def chat_events(self, messages, reasoning_effort="medium", web_search=False):
         """Async generator yielding (kind, value). Runs the fetch in the browser loop."""
@@ -498,13 +527,16 @@ class CurlEngine:
 
             needed = self.pool_size - len(self.token_pool)
             if needed > 0:
-                fetch_count = min(needed, 3)
-                for _ in range(fetch_count):
-                    try:
-                        res = await self._fetch_single_token()
+                fetch_count = min(needed, self.pool_size)
+                results = await asyncio.gather(
+                    *(self._fetch_single_token() for _ in range(fetch_count)),
+                    return_exceptions=True
+                )
+                for res in results:
+                    if isinstance(res, tuple) and len(res) == 2:
                         self.token_pool.append(res)
-                    except Exception as e:
-                        print(f"[Curl] Failed to fetch pooled token: {e}")
+                    else:
+                        print(f"[Curl] Failed to fetch pooled token: {res}")
 
             if not self.token_pool:
                 res = await self._fetch_single_token()
@@ -513,6 +545,14 @@ class CurlEngine:
             self._rr_index = (self._rr_index + 1) % len(self.token_pool)
             token, _ = self.token_pool[self._rr_index]
             return token
+
+    async def close(self):
+        print("[Curl] Closing AsyncSession connections...")
+        if self.session:
+            try:
+                await self.session.close()
+            except Exception as e:
+                print(f"[Curl] Error closing session: {e}")
 
     async def _fetch_single_token(self) -> Tuple[str, float]:
         r = await self.session.get(
@@ -616,6 +656,18 @@ async def startup():
             print("[!] Browser engine failed to start; check playwright install")
         else:
             print(f"[*] Browser engine ready: {engine._ready.is_set()}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    print("[*] Shutting down Inception Web-to-API...")
+    if hasattr(engine, "close"):
+        try:
+            res = engine.close()
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception as e:
+            print(f"[!] Error during shutdown: {e}")
 
 
 @app.get("/health")
@@ -792,6 +844,22 @@ def prepare_messages_for_tools(
     return copied
 
 
+def remove_spans(text: str, spans: List[Tuple[int, int]]) -> str:
+    """Removes a list of non-overlapping [start, end) spans from text, preserving other segments."""
+    if not spans:
+        return text
+    spans = sorted(spans, key=lambda x: x[0])
+    parts = []
+    last_idx = 0
+    for s_start, s_end in spans:
+        if s_start > last_idx:
+            parts.append(text[last_idx:s_start])
+        last_idx = max(last_idx, s_end)
+    if last_idx < len(text):
+        parts.append(text[last_idx:])
+    return "\n\n".join(p.strip() for p in parts if p.strip()).strip()
+
+
 def extract_tool_calls(
     text: str,
     valid_tool_names: List[str]
@@ -799,7 +867,7 @@ def extract_tool_calls(
     """Extracts tool calls from model output with multi-pattern tolerance:
     1. Natural calling syntax (e.g. Calling tool `todo` with arguments: {...})
     2. Action / Tool Call syntax (e.g. Tool Call: todo Arguments: {...})
-    3. Markdown ```json ... ``` code blocks
+    3. Markdown ```json ... ``` code blocks (aggregates ALL blocks across the message)
     4. Raw balanced JSON blocks containing {"name": "..."}
     Returns: (tool_calls_list or None, remaining_text)
     """
@@ -807,6 +875,8 @@ def extract_tool_calls(
         return None, text
 
     valid_names_lower = {name.lower(): name for name in valid_tool_names}
+    collected_tool_calls = []
+    matched_spans = []
 
     # -----------------------------------------------------------------------
     # Pattern 1: Natural Calling syntax (e.g. Calling tool `todo` with arguments: {...})
@@ -818,8 +888,7 @@ def extract_tool_calls(
     ]
 
     for pat in calling_patterns:
-        m = pat.search(text)
-        if m:
+        for m in pat.finditer(text):
             raw_tool_name = m.group(1).strip()
             matched_name = valid_names_lower.get(raw_tool_name.lower())
             if matched_name:
@@ -833,20 +902,18 @@ def extract_tool_calls(
                         final_args = args_str
 
                     call_id = "call_" + uuid.uuid4().hex[:16]
-                    tool_calls = [{
+                    collected_tool_calls.append({
                         "id": call_id,
                         "type": "function",
                         "function": {
                             "name": matched_name,
                             "arguments": final_args,
                         }
-                    }]
-                    # Keep conversational prefix before "Calling tool..." as remaining text
-                    remaining = (text[:m.start()] + text[b_end:]).strip()
-                    return tool_calls, remaining
+                    })
+                    matched_spans.append((m.start(), b_end))
 
     # -----------------------------------------------------------------------
-    # Pattern 2: Markdown code blocks (```json ... ``` or ``` ... ```)
+    # Pattern 2: Markdown code blocks (collect ALL blocks across message)
     # -----------------------------------------------------------------------
     code_block_pattern = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
     for match in code_block_pattern.finditer(text):
@@ -857,7 +924,7 @@ def extract_tool_calls(
             continue
 
         items = parsed if isinstance(parsed, list) else [parsed]
-        tool_calls = []
+        block_calls = []
 
         for item in items:
             if isinstance(item, dict) and "name" in item:
@@ -877,7 +944,7 @@ def extract_tool_calls(
                         args_str = json.dumps(str(args), ensure_ascii=False)
 
                     call_id = "call_" + uuid.uuid4().hex[:16]
-                    tool_calls.append({
+                    block_calls.append({
                         "id": call_id,
                         "type": "function",
                         "function": {
@@ -886,13 +953,17 @@ def extract_tool_calls(
                         }
                     })
 
-        if tool_calls:
-            start, end = match.span()
-            remaining = (text[:start] + text[end:]).strip()
-            return tool_calls, remaining
+        if block_calls:
+            collected_tool_calls.extend(block_calls)
+            matched_spans.append(match.span())
+
+    # If any calls found via Pattern 1 or Pattern 2, return aggregated
+    if collected_tool_calls:
+        remaining = remove_spans(text, matched_spans)
+        return collected_tool_calls, remaining
 
     # -----------------------------------------------------------------------
-    # Pattern 3: Raw balanced JSON blocks containing {"name": ...}
+    # Pattern 3: Raw balanced JSON blocks containing {"name": ...} (Fallback)
     # -----------------------------------------------------------------------
     pos = 0
     while pos < len(text):
@@ -907,7 +978,7 @@ def extract_tool_calls(
             continue
 
         items = parsed if isinstance(parsed, list) else [parsed]
-        tool_calls = []
+        raw_calls = []
 
         for item in items:
             if isinstance(item, dict) and "name" in item:
@@ -927,7 +998,7 @@ def extract_tool_calls(
                         args_str = json.dumps(str(args), ensure_ascii=False)
 
                     call_id = "call_" + uuid.uuid4().hex[:16]
-                    tool_calls.append({
+                    raw_calls.append({
                         "id": call_id,
                         "type": "function",
                         "function": {
@@ -936,9 +1007,13 @@ def extract_tool_calls(
                         }
                     })
 
-        if tool_calls:
-            remaining = (text[:b_start] + text[b_end:]).strip()
-            return tool_calls, remaining
+        if raw_calls:
+            collected_tool_calls.extend(raw_calls)
+            matched_spans.append((b_start, b_end))
+
+    if collected_tool_calls:
+        remaining = remove_spans(text, matched_spans)
+        return collected_tool_calls, remaining
 
     return None, text
 
@@ -994,6 +1069,8 @@ async def chat_completions(request: Request):
             requested_effort = "high"
         elif "low" in model:
             requested_effort = "low"
+        else:
+            requested_effort = DEFAULT_REASONING_EFFORT
     reasoning_effort = normalize_reasoning_effort(requested_effort)
     web_search = bool(body.get("web_search") or ("search" in model))
 

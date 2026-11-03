@@ -223,6 +223,25 @@ Action Input: {"command": "ls -la"}"""
         args = json.loads(tool_calls[0]["function"]["arguments"])
         self.assertEqual(args["command"], "ls -la")
 
+    def test_extract_tool_calls_multiple_independent_blocks(self):
+        text = """准备查看文件列表：
+```json
+{"name": "bash", "arguments": {"command": "ls"}}
+```
+同时查看当前路径：
+```json
+{"name": "bash", "arguments": {"command": "pwd"}}
+```
+操作准备完毕。"""
+        tool_calls, remaining = extract_tool_calls(text, ["bash"])
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(json.loads(tool_calls[0]["function"]["arguments"])["command"], "ls")
+        self.assertEqual(json.loads(tool_calls[1]["function"]["arguments"])["command"], "pwd")
+        self.assertIn("准备查看文件列表：", remaining)
+        self.assertIn("同时查看当前路径：", remaining)
+        self.assertIn("操作准备完毕。", remaining)
+
     def test_compact_tool_definitions(self):
         tools = [
             {

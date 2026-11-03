@@ -138,6 +138,7 @@ systemctl enable --now inception-api
 | `PROXY_URL` | 空（直连） | 上游代理地址（如 `http://127.0.0.1:7890` 或 SOCKS5）。使用 `curl` 引擎且处于机房 IP 时强烈推荐配置 |
 | `API_KEY` | 空 | 自定义 API 鉴权密钥。若设置，请求需携带 `Authorization: Bearer <API_KEY>`；留空则直接放行 |
 | `POOL_SIZE` | `5` | 会话 Token 轮询池容量。多并发请求自动轮询使用不同 Token，防止单会话频控 |
+| `DEFAULT_REASONING_EFFORT` | `medium` | 全局默认思考深度：`instant`（零思考极速）、`low`、`medium`、`high`。方便不支持传参的客户端全局免思考 |
 | `DEFAULT_MODEL` | `mercury-3` | 默认模型名称 |
 | `CHROME_PATH` | 自动探测 | Chromium 可执行文件路径（默认自动探测 `/usr/bin/chromium` 等） |
 
