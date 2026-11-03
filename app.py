@@ -69,6 +69,118 @@ def current_timestamp() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Upstream Payload Normalization (Vercel AI SDK compatibility)
+# ---------------------------------------------------------------------------
+def normalize_upstream_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalizes OpenAI messages array strictly for Inception Web API (/api/chat):
+    - Upstream only supports 'user' and 'assistant' roles (Vercel AI SDK useChat).
+    - 'system' and 'developer' roles are extracted and prepended to the first 'user' message.
+    - 'tool' / 'function' roles are flattened to 'user' messages.
+    - 'assistant' tool_calls are converted to readable text.
+    - Guarantees the last message has role='user'.
+    """
+    system_parts = []
+    cleaned_messages = []
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        tool_calls = m.get("tool_calls")
+
+        # Handle system/developer roles
+        if role in ("system", "developer"):
+            if content:
+                system_parts.append(str(content).strip())
+            continue
+
+        # Handle tool/function roles
+        elif role in ("tool", "function"):
+            tool_id = m.get("tool_call_id") or m.get("name") or "tool"
+            cleaned_messages.append({
+                "role": "user",
+                "content": f"[Tool Execution Result for `{tool_id}`]:\n{content}"
+            })
+            continue
+
+        # Handle assistant tool_calls
+        elif role == "assistant" and tool_calls:
+            calls_summary = []
+            for tc in tool_calls:
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                fname = fn.get("name", "unknown")
+                fargs = fn.get("arguments", "{}")
+                calls_summary.append(f"Calling tool `{fname}` with arguments: {fargs}")
+            summary_str = "\n".join(calls_summary)
+            if content:
+                content = f"{content}\n{summary_str}"
+            else:
+                content = summary_str
+
+        # Standard assistant or user
+        cleaned_messages.append({"role": role if role in ("user", "assistant") else "user", "content": content})
+
+    # Prepend all collected system instructions to the first user message
+    if system_parts:
+        merged_system = "\n\n".join(system_parts)
+        system_prefix = f"[System Instructions]\n{merged_system}\n\n"
+        first_user_idx = next((i for i, msg in enumerate(cleaned_messages) if msg["role"] == "user"), None)
+        if first_user_idx is not None:
+            cleaned_messages[first_user_idx]["content"] = system_prefix + str(cleaned_messages[first_user_idx]["content"])
+        else:
+            # If no user message was present, create one with the system prompt
+            cleaned_messages.insert(0, {"role": "user", "content": merged_system})
+
+    # Ensure there is at least one message and the last message is 'user'
+    if not cleaned_messages:
+        cleaned_messages.append({"role": "user", "content": "Hello"})
+    elif cleaned_messages[-1]["role"] != "user":
+        cleaned_messages.append({"role": "user", "content": "Please continue."})
+
+    return cleaned_messages
+
+
+def build_upstream_payload(
+    messages: List[Dict[str, Any]],
+    reasoning_effort: str = "medium",
+    web_search: bool = False,
+    chat_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Constructs a strict, error-free payload matching Vercel AI SDK useChat protocol."""
+    norm_messages = normalize_upstream_messages(messages)
+    chat_id = chat_id or ("chat_" + uuid.uuid4().hex[:12])
+
+    formatted_messages = []
+    for i, m in enumerate(norm_messages):
+        mid = f"msg_{i}_{uuid.uuid4().hex[:8]}"
+        role = m["role"]
+        content = m.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append({"type": "text", "text": p.get("text", "")})
+        else:
+            parts = [{"type": "text", "text": str(content)}]
+        formatted_messages.append({"id": mid, "role": role, "parts": parts})
+
+    last_msg_id = formatted_messages[-1]["id"]
+    return {
+        "id": chat_id,
+        "messageId": last_msg_id,  # Strictly equals the id of the last message
+        "trigger": "submit-message",
+        "messages": formatted_messages,
+        "reasoningEffort": reasoning_effort,
+        "webSearchEnabled": web_search,
+        "voiceMode": False,
+        "timezone": "Asia/Shanghai",
+        "language": "zh-CN",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Engine 1: Playwright headless browser bridge (default)
 # ---------------------------------------------------------------------------
 class BrowserBridgeEngine:
@@ -248,31 +360,12 @@ class BrowserBridgeEngine:
         queue = asyncio.Queue()
         self.active_queues[req_id] = queue
 
-        formatted_messages = []
-        for i, m in enumerate(messages):
-            mid = f"msg_{i}_{uuid.uuid4().hex[:8]}"
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            if isinstance(content, list):
-                parts = []
-                for p in content:
-                    if isinstance(p, dict) and p.get("type") == "text":
-                        parts.append({"type": "text", "text": p.get("text", "")})
-            else:
-                parts = [{"type": "text", "text": str(content)}]
-            formatted_messages.append({"id": mid, "role": role, "parts": parts})
-
-        payload = {
-            "id": "chat_" + req_id,
-            "messageId": "msg_" + req_id,
-            "trigger": "submit-message",
-            "messages": formatted_messages,
-            "reasoningEffort": reasoning_effort,
-            "webSearchEnabled": web_search,
-            "voiceMode": False,
-            "timezone": "Asia/Shanghai",
-            "language": "zh-CN",
-        }
+        payload = build_upstream_payload(
+            messages,
+            reasoning_effort=reasoning_effort,
+            web_search=web_search,
+            chat_id="chat_" + req_id,
+        )
 
         token = await self.get_token()
 
@@ -385,33 +478,13 @@ class CurlEngine:
     async def chat_events(self, messages, reasoning_effort="medium", web_search=False):
         token = self.get_token()
         chat_id = "chat_" + uuid.uuid4().hex[:12]
-        msg_id = "msg_" + uuid.uuid4().hex[:12]
 
-        formatted_messages = []
-        for i, m in enumerate(messages):
-            mid = f"msg_{i}_{uuid.uuid4().hex[:8]}"
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            if isinstance(content, list):
-                parts = []
-                for p in content:
-                    if isinstance(p, dict) and p.get("type") == "text":
-                        parts.append({"type": "text", "text": p.get("text", "")})
-            else:
-                parts = [{"type": "text", "text": str(content)}]
-            formatted_messages.append({"id": mid, "role": role, "parts": parts})
-
-        payload = {
-            "id": chat_id,
-            "messageId": msg_id,
-            "trigger": "submit-message",
-            "messages": formatted_messages,
-            "reasoningEffort": reasoning_effort,
-            "webSearchEnabled": web_search,
-            "voiceMode": False,
-            "timezone": "Asia/Shanghai",
-            "language": "zh-CN",
-        }
+        payload = build_upstream_payload(
+            messages,
+            reasoning_effort=reasoning_effort,
+            web_search=web_search,
+            chat_id=chat_id,
+        )
 
         headers = {
             "Content-Type": "application/json",
@@ -533,36 +606,21 @@ def parse_tool_definitions(
 
 
 def build_tool_system_prompt(tool_defs: List[Dict[str, Any]], tool_choice: Any = "auto") -> str:
-    """Builds a strict, unambiguous system prompt instructing the model how to call tools."""
-    tools_json = json.dumps(tool_defs, ensure_ascii=False, indent=2)
+    """Builds a compact, unambiguous system prompt instructing the model how to call tools."""
+    # Compact JSON serialization to prevent token bloat
+    tools_json = json.dumps(tool_defs, ensure_ascii=False, separators=(',', ':'))
     prompt = [
-        "## Tools and Functions",
-        "You have access to the following functions to assist the user:",
-        "```json",
-        tools_json,
-        "```",
+        "## Tools",
+        f"You have access to the following functions:\n```json\n{tools_json}\n```",
         "",
         "## Tool Call Protocol",
-        "If you decide to invoke any of the listed functions, you MUST output your response in the following JSON format enclosed in a ```json code block.",
-        'Each call must be an object with "name" (the function name) and "arguments" (a key-value dictionary of arguments conforming to the function\'s parameters):',
+        "If you decide to invoke any function, you MUST reply with a ```json code block containing:",
         "```json",
-        "{",
-        '  "name": "function_name",',
-        '  "arguments": {',
-        '    "param_name": "value"',
-        "  }",
-        "}",
-        "```",
-        "If multiple tool calls are needed, you may output a JSON array of such objects:",
-        "```json",
-        "[",
-        '  {"name": "func_1", "arguments": {...}},',
-        '  {"name": "func_2", "arguments": {...}}',
-        "]",
+        '{"name": "function_name", "arguments": {"param": "value"}}',
         "```",
         "STRICT RULES:",
-        "1. When calling a tool, output ONLY the ```json ... ``` code block. Do NOT include conversational filler, greetings, or explanations before or after the code block.",
-        '2. The "arguments" MUST be a valid JSON dictionary matching the schema.',
+        "1. Output ONLY the ```json ... ``` code block. Do NOT include conversational filler, greetings, or explanations before or after the code block.",
+        '2. The "arguments" MUST be a valid JSON dictionary matching the function schema.',
         "3. If no function needs to be called, answer normally with plain natural language. Do NOT output a tool call JSON.",
     ]
 
@@ -580,49 +638,11 @@ def prepare_messages_for_tools(
     messages: List[Dict[str, Any]],
     tool_prompt: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """Transforms chat messages to flatten tool calls/results into upstream-compatible text."""
-    transformed = []
-    system_injected = False
-
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        tool_calls = m.get("tool_calls")
-
-        # 1. Flatten assistant tool_calls into readable text if present
-        if role == "assistant" and tool_calls:
-            calls_summary = []
-            for tc in tool_calls:
-                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                fname = fn.get("name", "unknown")
-                fargs = fn.get("arguments", "{}")
-                calls_summary.append(f"Calling tool `{fname}` with arguments: {fargs}")
-            summary_str = "\n".join(calls_summary)
-            if content:
-                content = f"{content}\n{summary_str}"
-            else:
-                content = summary_str
-
-        # 2. Flatten tool/function results into user messages
-        elif role in ("tool", "function"):
-            tool_id = m.get("tool_call_id") or m.get("name") or "tool"
-            role = "user"
-            content = f"[Tool Execution Result for `{tool_id}`]:\n{content}"
-
-        # 3. Inject tool prompt into system message if available
-        elif role == "system" and tool_prompt and not system_injected:
-            content = f"{content}\n\n{tool_prompt}" if content else tool_prompt
-            system_injected = True
-
-        transformed.append({"role": role, "content": content})
-
-    # If no existing system message was found, prepend one
-    if tool_prompt and not system_injected:
-        transformed.insert(0, {"role": "system", "content": tool_prompt})
-
-    return transformed
+    """Appends tool_prompt to messages as a system message if provided."""
+    copied = list(messages)
+    if tool_prompt:
+        copied.append({"role": "system", "content": tool_prompt})
+    return copied
 
 
 def extract_tool_calls(

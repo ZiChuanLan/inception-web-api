@@ -7,6 +7,8 @@ from app import (
     build_tool_system_prompt,
     prepare_messages_for_tools,
     extract_tool_calls,
+    normalize_upstream_messages,
+    build_upstream_payload,
     app,
 )
 from fastapi.testclient import TestClient
@@ -59,7 +61,7 @@ class TestToolEmulation(unittest.TestCase):
     def test_build_tool_system_prompt(self):
         tool_defs, _ = parse_tool_definitions(self.sample_tools)
         prompt = build_tool_system_prompt(tool_defs, tool_choice="auto")
-        self.assertIn("## Tools and Functions", prompt)
+        self.assertIn("## Tools", prompt)
         self.assertIn("get_weather", prompt)
         self.assertIn("```json", prompt)
 
@@ -90,27 +92,68 @@ class TestToolEmulation(unittest.TestCase):
         ]
         tool_prompt = "TOOL_PROMPT_MOCK"
         transformed = prepare_messages_for_tools(messages, tool_prompt=tool_prompt)
+        self.assertEqual(len(transformed), 5)
+        self.assertEqual(transformed[-1]["role"], "system")
+        self.assertEqual(transformed[-1]["content"], "TOOL_PROMPT_MOCK")
 
-        # 1. System prompt should have tool_prompt appended
-        self.assertEqual(transformed[0]["role"], "system")
-        self.assertIn("TOOL_PROMPT_MOCK", transformed[0]["content"])
-        self.assertIn("You are a helpful assistant.", transformed[0]["content"])
+    def test_normalize_upstream_messages(self):
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Write a python script."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{\"cmd\": \"ls\"}"}
+                    }
+                ]
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "file1.txt\nfile2.txt"},
+            {"role": "system", "content": "Additional tool schema"}
+        ]
+        norm = normalize_upstream_messages(messages)
 
-        # 2. Assistant tool calls should be flattened to text
-        self.assertEqual(transformed[2]["role"], "assistant")
-        self.assertIn("Calling tool `get_weather`", transformed[2]["content"])
+        # 1. No system role allowed in upstream
+        roles = [m["role"] for m in norm]
+        self.assertNotIn("system", roles)
+        self.assertNotIn("tool", roles)
 
-        # 3. Tool result should be converted to user message
-        self.assertEqual(transformed[3]["role"], "user")
-        self.assertIn("[Tool Execution Result for `call_123`]:", transformed[3]["content"])
+        # 2. System prompt prepended to the first user message
+        first_user = norm[0]
+        self.assertEqual(first_user["role"], "user")
+        self.assertIn("[System Instructions]", first_user["content"])
+        self.assertIn("You are a coding agent.", first_user["content"])
+        self.assertIn("Additional tool schema", first_user["content"])
+        self.assertIn("Write a python script.", first_user["content"])
 
-    def test_prepare_messages_no_system(self):
-        messages = [{"role": "user", "content": "Hello"}]
-        transformed = prepare_messages_for_tools(messages, tool_prompt="SYSTEM_INJECTED")
-        self.assertEqual(len(transformed), 2)
-        self.assertEqual(transformed[0]["role"], "system")
-        self.assertEqual(transformed[0]["content"], "SYSTEM_INJECTED")
-        self.assertEqual(transformed[1]["role"], "user")
+        # 3. Assistant tool calls flattened
+        self.assertIn("Calling tool `bash`", norm[1]["content"])
+
+        # 4. Tool result flattened to user
+        self.assertEqual(norm[2]["role"], "user")
+        self.assertIn("[Tool Execution Result for `call_abc`]:", norm[2]["content"])
+
+        # 5. Last message must be user
+        self.assertEqual(norm[-1]["role"], "user")
+
+    def test_build_upstream_payload_message_id_binding(self):
+        messages = [
+            {"role": "system", "content": "sys prompt"},
+            {"role": "user", "content": "hello"}
+        ]
+        payload = build_upstream_payload(messages, reasoning_effort="high", web_search=True)
+
+        self.assertEqual(payload["reasoningEffort"], "high")
+        self.assertTrue(payload["webSearchEnabled"])
+        self.assertEqual(len(payload["messages"]), 1)
+        self.assertEqual(payload["messages"][0]["role"], "user")
+
+        # messageId must strictly equal the id of the last message in messages array
+        last_id = payload["messages"][-1]["id"]
+        self.assertEqual(payload["messageId"], last_id)
 
     def test_extract_tool_calls_markdown(self):
         text = """I will check the weather for you.
