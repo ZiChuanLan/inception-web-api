@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  inception-api:
+    build: .
+    container_name: inception-api
+    restart: unless-stopped
+    ports:
+      - "8011:8011"
+    environment:
+      - PORT=8011
+      # 如果部署在海外 VPS（可以直接访问 inceptionlabs.ai），PROXY_URL 留空即可；
+      # 如果在国内服务器，可配置 HTTP/SOCKS5 代理，例如: http://172.17.0.1:7890
+      - PROXY_URL=
+      # 可选：如果需要为接口添加鉴权密钥，请设置此变量；留空则为公开接口
+      - API_KEY=
+      - DEFAULT_MODEL=mercury-3
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8011/health\")'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
