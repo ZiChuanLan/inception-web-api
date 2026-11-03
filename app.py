@@ -38,6 +38,11 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "mercury-3")
 ENGINE = os.getenv("ENGINE", "browser").strip().lower()
 CHROME_PATH = os.getenv("CHROME_PATH", "").strip() or None
 
+try:
+    POOL_SIZE = int(os.getenv("POOL_SIZE", "5"))
+except ValueError:
+    POOL_SIZE = 5
+
 app = FastAPI(
     title="Inception Mercury Web-to-API",
     description="Headless browser bridge with OpenAI-compatible API for Inception Mercury 3",
@@ -188,9 +193,10 @@ class BrowserBridgeEngine:
     """Runs a persistent headless Chromium in a dedicated background event loop,
     accepts chat requests via run_coroutine_threadsafe, returns SSE yield coroutine."""
 
-    def __init__(self, proxy: Optional[str] = None, chrome_path: Optional[str] = None):
+    def __init__(self, proxy: Optional[str] = None, chrome_path: Optional[str] = None, pool_size: int = 5):
         self.proxy = proxy
         self.chrome_path = chrome_path
+        self.pool_size = max(1, pool_size)
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -198,9 +204,9 @@ class BrowserBridgeEngine:
         self._page = None
         self._browser = None
         self._playwright = None
-        self.token = None
-        self.token_expire = 0.0
+        self.token_pool: List[Tuple[str, float]] = []
         self._token_lock = asyncio.Lock()
+        self._rr_index = 0
         self.active_queues = {}
         self.failed = False
 
@@ -335,22 +341,46 @@ class BrowserBridgeEngine:
     async def _get_token_inner(self, force_refresh=False):
         async with self._token_lock:
             now = self.loop.time()
-            if not self.token or now > self.token_expire or force_refresh:
+            if force_refresh:
+                self.token_pool.clear()
+
+            valid_pool = [item for item in self.token_pool if item[1] > now + 30]
+            self.token_pool = valid_pool
+
+            needed = self.pool_size - len(self.token_pool)
+            if needed > 0:
+                fetch_count = min(needed, 3)
+                for _ in range(fetch_count):
+                    try:
+                        res = await self._page.evaluate("""async () => {
+                            try {
+                                const r = await fetch('/api/session');
+                                return { status: r.status, data: await r.json() };
+                            } catch (e) {
+                                return { err: e.toString() };
+                            }
+                        }""")
+                        if res.get("status") == 200 and res.get("data", {}).get("ok"):
+                            tok = res["data"]["token"]
+                            self.token_pool.append((tok, now + 600))
+                            print(f"[Bridge] Pooled token added ({len(self.token_pool)}/{self.pool_size}): {tok[:18]}...")
+                    except Exception as e:
+                        print(f"[Bridge] Failed to fetch pooled token: {e}")
+
+            if not self.token_pool:
                 res = await self._page.evaluate("""async () => {
-                    try {
-                        const r = await fetch('/api/session');
-                        return { status: r.status, data: await r.json() };
-                    } catch (e) {
-                        return { err: e.toString() };
-                    }
+                    const r = await fetch('/api/session');
+                    return { status: r.status, data: await r.json() };
                 }""")
                 if res.get("status") == 200 and res.get("data", {}).get("ok"):
-                    self.token = res["data"]["token"]
-                    self.token_expire = now + 600
-                    print(f"[Bridge] Fresh session token acquired: {self.token[:18]}...")
+                    tok = res["data"]["token"]
+                    self.token_pool.append((tok, now + 600))
                 else:
                     raise RuntimeError(f"Failed to fetch session token: {res}")
-            return self.token
+
+            self._rr_index = (self._rr_index + 1) % len(self.token_pool)
+            token, _ = self.token_pool[self._rr_index]
+            return token
 
     async def chat_events(self, messages, reasoning_effort="medium", web_search=False):
         """Async generator yielding (kind, value). Runs the fetch in the browser loop."""
@@ -443,41 +473,67 @@ class BrowserBridgeEngine:
 
 
 # ---------------------------------------------------------------------------
-# Engine 2: curl_cffi zero-browser fallback
+# Engine 2: curl_cffi zero-browser fallback (Async non-blocking)
 # ---------------------------------------------------------------------------
 class CurlEngine:
-    def __init__(self, proxy: Optional[str] = None):
+    def __init__(self, proxy: Optional[str] = None, pool_size: int = 5):
         from curl_cffi import requests as cr
         self.requests = cr
         self.proxy = proxy
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
-        self.token = None
-        self.token_expire_time = 0.0
-        self.session = cr.Session(impersonate="chrome120", proxies=self.proxies)
+        self.pool_size = max(1, pool_size)
+        self.session = cr.AsyncSession(impersonate="chrome120", proxies=self.proxies)
+        self.token_pool: List[Tuple[str, float]] = []
+        self._token_lock = asyncio.Lock()
+        self._rr_index = 0
 
-    def get_token(self) -> str:
-        now = time.time()
-        if not self.token or now > self.token_expire_time:
-            r = self.session.get(
-                "https://chat.inceptionlabs.ai/api/session",
-                timeout=15,
-                headers={
-                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                   "Chrome/120.0.0.0 Safari/537.36"),
-                    "Accept": "*/*",
-                    "Referer": "https://chat.inceptionlabs.ai/",
-                },
-            )
-            if r.status_code != 200:
-                raise RuntimeError(f"Failed to fetch session: HTTP {r.status_code} - {r.text}")
-            data = r.json()
-            self.token = data["token"]
-            self.token_expire_time = now + 600
-        return self.token
+    async def get_token(self, force_refresh: bool = False) -> str:
+        async with self._token_lock:
+            now = time.time()
+            if force_refresh:
+                self.token_pool.clear()
+
+            valid_pool = [item for item in self.token_pool if item[1] > now + 30]
+            self.token_pool = valid_pool
+
+            needed = self.pool_size - len(self.token_pool)
+            if needed > 0:
+                fetch_count = min(needed, 3)
+                for _ in range(fetch_count):
+                    try:
+                        res = await self._fetch_single_token()
+                        self.token_pool.append(res)
+                    except Exception as e:
+                        print(f"[Curl] Failed to fetch pooled token: {e}")
+
+            if not self.token_pool:
+                res = await self._fetch_single_token()
+                self.token_pool.append(res)
+
+            self._rr_index = (self._rr_index + 1) % len(self.token_pool)
+            token, _ = self.token_pool[self._rr_index]
+            return token
+
+    async def _fetch_single_token(self) -> Tuple[str, float]:
+        r = await self.session.get(
+            "https://chat.inceptionlabs.ai/api/session",
+            timeout=15,
+            headers={
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/120.0.0.0 Safari/537.36"),
+                "Accept": "*/*",
+                "Referer": "https://chat.inceptionlabs.ai/",
+            },
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to fetch session: HTTP {r.status_code} - {r.text}")
+        data = r.json()
+        token = data["token"]
+        return token, time.time() + 600
 
     async def chat_events(self, messages, reasoning_effort="medium", web_search=False):
-        token = self.get_token()
+        token = await self.get_token()
         chat_id = "chat_" + uuid.uuid4().hex[:12]
 
         payload = build_upstream_payload(
@@ -494,7 +550,7 @@ class CurlEngine:
             "Referer": "https://chat.inceptionlabs.ai/",
         }
 
-        r = self.session.post(
+        r = await self.session.post(
             "https://chat.inceptionlabs.ai/api/chat",
             headers=headers,
             json=payload,
@@ -504,9 +560,9 @@ class CurlEngine:
         if r.status_code != 200:
             raise RuntimeError(f"Inception Chat returned HTTP {r.status_code}: {r.text}")
 
-        for line in r.iter_lines():
+        async for line in r.aiter_lines():
             if line:
-                decoded = line.decode("utf-8", errors="ignore")
+                decoded = line.decode("utf-8", errors="ignore") if isinstance(line, bytes) else str(line)
                 if decoded.startswith("data: "):
                     raw_data = decoded[6:].strip()
                     if raw_data == "[DONE]":
@@ -531,12 +587,12 @@ class CurlEngine:
 # Engine selection
 # ---------------------------------------------------------------------------
 if ENGINE == "browser":
-    print("[*] Engine: Playwright headless browser bridge")
-    engine = BrowserBridgeEngine(proxy=PROXY_URL, chrome_path=CHROME_PATH)
+    print(f"[*] Engine: Playwright headless browser bridge (Pool size: {POOL_SIZE})")
+    engine = BrowserBridgeEngine(proxy=PROXY_URL, chrome_path=CHROME_PATH, pool_size=POOL_SIZE)
     engine.start()
 elif ENGINE == "curl":
-    print("[*] Engine: curl_cffi zero-browser (may fail on datacenter IPs)")
-    engine = CurlEngine(proxy=PROXY_URL)
+    print(f"[*] Engine: curl_cffi zero-browser (Pool size: {POOL_SIZE})")
+    engine = CurlEngine(proxy=PROXY_URL, pool_size=POOL_SIZE)
 else:
     raise SystemExit(f"Unknown ENGINE={ENGINE}; use browser or curl")
 
@@ -568,6 +624,8 @@ async def health():
         "status": "ok",
         "service": "inception-web-api",
         "engine": ENGINE,
+        "pool_size": POOL_SIZE,
+        "active_tokens": len(getattr(engine, "token_pool", [])),
         "proxy": PROXY_URL is not None,
         "browser_ready": engine._ready.is_set() if ENGINE == "browser" else True,
     }

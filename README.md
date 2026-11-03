@@ -40,6 +40,7 @@ An OpenAI-compatible **API Gateway** for Inception Labs Mercury 3 (Diffusion LLM
   - 完美适配 OpenAI `reasoning_effort` 与 DeepSeek R1 规范的 `reasoning_content`。
 - **🌐 实时联网搜索 (Live Web Search)**：原生支持开启网络搜索，自动捕获并返回来源引用（`citations`）。
 - **⚡ 双模传输全兼容**：标准 SSE 流式直出（`stream=true`）与非流式聚合返回（`stream=false`）完全一致。
+- **🚀 全异步非阻塞高并发与 Token 资源池 (Session Pooling)**：`curl` 引擎全面升级为 `AsyncSession` 原生协程迭代，主线程零阻塞；内置多会话 Token 轮询池（`POOL_SIZE` 默认 5），彻底破除单并发卡顿瓶颈。
 - **🛠️ 工具调用与函数执行支持 (Tool / Function Calling Emulation)**：内置网关层双向协议虚拟化转译，完整兼容 OpenAI `tools`、`functions`、`tool_choice`，支持 Agent 循环与多轮工具调用，无缝对接 Dify、Cherry Studio、LangChain 等框架。
 - **🔌 即插即用生态**：无缝接入 OneAPI / NewAPI / NextChat / OpenAI SDK / Dify / 沉浸式翻译等生态。
 
@@ -136,6 +137,7 @@ systemctl enable --now inception-api
 | `ENGINE` | `browser` | 引擎模式：`browser`（浏览器桥接，稳过机房盾）或 `curl`（纯协议零浏览器，仅 50MB） |
 | `PROXY_URL` | 空（直连） | 上游代理地址（如 `http://127.0.0.1:7890` 或 SOCKS5）。使用 `curl` 引擎且处于机房 IP 时强烈推荐配置 |
 | `API_KEY` | 空 | 自定义 API 鉴权密钥。若设置，请求需携带 `Authorization: Bearer <API_KEY>`；留空则直接放行 |
+| `POOL_SIZE` | `5` | 会话 Token 轮询池容量。多并发请求自动轮询使用不同 Token，防止单会话频控 |
 | `DEFAULT_MODEL` | `mercury-3` | 默认模型名称 |
 | `CHROME_PATH` | 自动探测 | Chromium 可执行文件路径（默认自动探测 `/usr/bin/chromium` 等） |
 
