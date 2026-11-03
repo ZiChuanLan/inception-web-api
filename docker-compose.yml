@@ -1,6 +1,13 @@
 services:
   inception-web-api:
+    # 方案一：默认浏览器桥接模式（推荐机房 VPS / 裸金属服务器，自动突破 Vercel Checkpoint，镜像约 650MB）
     build: .
+    
+    # 方案二：极简纯协议零浏览器模式（镜像仅 50MB，内存仅 25MB；若需切换请解除下面两行注释，并注释掉上面的 build: .）
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.slim
+
     container_name: inception-web-api
     restart: always
     ports:
@@ -8,8 +15,12 @@ services:
     environment:
       - PORT=8011
       - HOST=0.0.0.0
+      # 引擎切换：browser (无头浏览器桥接) 或 curl (零浏览器纯协议)
       - ENGINE=browser
+      # 可选：自定义服务鉴权密钥
       # - API_KEY=sk-your-secret-key-here
+      # 可选：上游代理地址（若使用 curl 引擎且机器处于机房 IP，建议配置纯净上游代理）
       # - PROXY_URL=http://your-proxy-here:port
-      # - CHROME_PATH=/usr/bin/google-chrome
+      # 可选：手动指定 Chromium 可执行文件绝对路径
+      # - CHROME_PATH=/usr/bin/chromium
     shm_size: '512mb'

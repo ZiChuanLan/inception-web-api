@@ -1,0 +1,15 @@
+services:
+  inception-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.slim
+    container_name: inception-web-api-slim
+    restart: unless-stopped
+    ports:
+      - "8011:8011"
+    environment:
+      - PORT=8011
+      - HOST=0.0.0.0
+      - ENGINE=curl
+      # - PROXY_URL=http://your-clean-proxy:7890
+      # - API_KEY=sk-mysecretkey
