@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-orange.svg)](LICENSE)
 
 An OpenAI-compatible **API Gateway** for Inception Labs Mercury 3 (Diffusion LLM).
 
@@ -249,7 +249,13 @@ if tool_res.choices[0].message.tool_calls:
 
 ## 📄 License
 
-[MIT License](LICENSE) © 2026 ZiChuanLan
+[GNU AGPLv3](LICENSE) © 2026 ZiChuanLan
+
+本项目采用 **GNU Affero General Public License v3.0**（AGPL-3.0-or-later）授权。
+
+> **为什么是 AGPL 而不是 MIT？**
+> AGPL 在 GPL 的基础上专门针对**网络服务**做了补充：任何人在服务器上部署本项目、并通过网络向他人提供 API 服务时，若对代码做了修改，**必须向该服务的所有使用者公开修改后的完整源代码**。
+> 这样既能保持项目完全开源、任何人都可自由使用和修改，也能避免本项目的协议适配与工具转译等实现被闭源打包、转手做成收费中转服务。
 
 ---
 ### 友情链接

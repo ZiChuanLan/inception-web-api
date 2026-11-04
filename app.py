@@ -2,6 +2,20 @@
 Inception Mercury Web-to-API Service (Headless Browser Bridge Edition)
 Exposes an OpenAI-compatible /v1/chat/completions API.
 
+Copyright (C) 2026 ZiChuanLan
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 Features:
 - Playwright headless Chromium bridge: real browser network stack satisfies Vercel
   Security Checkpoint & Turnstile by native in-page fetch (works from ANY IP,
@@ -13,25 +27,25 @@ Features:
 - Optional curl_cffi zero-browser fallback engine (ENGINE=curl)
 """
 
+import asyncio
+import json
 import os
-import sys
 import re
+import threading
 import time
 import uuid
-import json
-import asyncio
-import threading
-from typing import List, Dict, Any, Optional, Tuple
-from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import StreamingResponse, JSONResponse
+from typing import Any
+
 import uvicorn
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 try:
     PORT = int(os.getenv("PORT", "8011"))
 except ValueError:
     PORT = 8011
 
-HOST = os.getenv("HOST", "0.0.0.0")
+HOST = os.getenv("HOST", "0.0.0.0")  # noqa: S104 - containerized gateway must bind all interfaces
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 API_KEY = os.getenv("API_KEY", "").strip() or None
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "mercury-3")
@@ -78,7 +92,7 @@ app = FastAPI(
 
 REASONING_LEVELS = {"instant", "low", "medium", "high"}
 
-def normalize_reasoning_effort(val: Optional[str]) -> str:
+def normalize_reasoning_effort(val: str | None) -> str:
     if not val:
         return "medium"
     val = str(val).lower().strip()
@@ -139,7 +153,7 @@ def fit_content(content_str: str) -> str:
     return content_str
 
 
-def normalize_upstream_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+def normalize_upstream_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     """
     Normalizes OpenAI messages array strictly for Inception Web API (/api/chat):
     - Upstream only supports 'user' and 'assistant' roles (Vercel AI SDK useChat).
@@ -224,11 +238,11 @@ def normalize_upstream_messages(messages: List[Dict[str, Any]]) -> List[Dict[str
 
 
 def build_upstream_payload(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     reasoning_effort: str = "medium",
     web_search: bool = False,
-    chat_id: Optional[str] = None
-) -> Dict[str, Any]:
+    chat_id: str | None = None
+) -> dict[str, Any]:
     """Constructs a strict, error-free payload matching Vercel AI SDK useChat protocol."""
     norm_messages = normalize_upstream_messages(messages)
     chat_id = chat_id or ("chat_" + uuid.uuid4().hex[:12])
@@ -268,18 +282,18 @@ class BrowserBridgeEngine:
     """Runs a persistent headless Chromium in a dedicated background event loop,
     accepts chat requests via run_coroutine_threadsafe, returns SSE yield coroutine."""
 
-    def __init__(self, proxy: Optional[str] = None, chrome_path: Optional[str] = None, pool_size: int = 5):
+    def __init__(self, proxy: str | None = None, chrome_path: str | None = None, pool_size: int = 5):
         self.proxy = proxy
         self.chrome_path = chrome_path
         self.pool_size = max(1, pool_size)
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._ready = asyncio.Event()
-        self._page = None
-        self._browser = None
-        self._playwright = None
-        self.token_pool: List[Tuple[str, float]] = []
+        self._page: Any = None
+        self._browser: Any = None
+        self._playwright: Any = None
+        self.token_pool: list[tuple[str, float]] = []
         self._token_lock = asyncio.Lock()
         self._rr_index = 0
         self.active_queues = {}
@@ -415,7 +429,11 @@ class BrowserBridgeEngine:
 
     async def _get_token_inner(self, force_refresh=False):
         async with self._token_lock:
-            now = self.loop.time()
+            loop = self.loop
+            page = self._page
+            if loop is None or page is None:
+                raise RuntimeError("Browser bridge is not initialized")
+            now = loop.time()
             if force_refresh:
                 self.token_pool.clear()
 
@@ -467,20 +485,20 @@ class BrowserBridgeEngine:
             try:
                 fut = self._submit(self._page.close())
                 await asyncio.wrap_future(fut)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Bridge] Error closing page: {e}")
         if self.loop and self._browser:
             try:
                 fut = self._submit(self._browser.close())
                 await asyncio.wrap_future(fut)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Bridge] Error closing browser: {e}")
         if self.loop and self._playwright:
             try:
                 fut = self._submit(self._playwright.stop())
                 await asyncio.wrap_future(fut)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Bridge] Error stopping playwright: {e}")
         if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)
 
@@ -512,7 +530,7 @@ class BrowserBridgeEngine:
             )
         except Exception as e:
             self.active_queues.pop(req_id, None)
-            raise RuntimeError(f"Failed to dispatch chat in browser: {e}")
+            raise RuntimeError(f"Failed to dispatch chat in browser: {e}") from e
 
         try:
             buffer = ""
@@ -526,7 +544,7 @@ class BrowserBridgeEngine:
                     stage = "idle" if got_first else "first token"
                     raise RuntimeError(
                         f"Upstream stream timeout ({stage} > {timeout:.0f}s); browser bridge stopped responding"
-                    )
+                    ) from None
                 kind = item[0]
                 if kind == "chunk":
                     got_first = True
@@ -551,8 +569,9 @@ class BrowserBridgeEngine:
                                         title = ev.get("title", "")
                                         if url and url != "__searching__":
                                             yield ("citation", {"url": url, "title": title})
-                                except Exception:
-                                    pass
+                                except (json.JSONDecodeError, AttributeError, TypeError, KeyError):
+                                    # Malformed SSE frame from upstream - skip it, keep stream alive
+                                    continue
                 elif kind == "done":
                     status = item[1]
                     err = item[2]
@@ -576,8 +595,9 @@ class BrowserBridgeEngine:
                                             title = ev.get("title", "")
                                             if url and url != "__searching__":
                                                 yield ("citation", {"url": url, "title": title})
-                                    except Exception:
-                                        pass
+                                    except (json.JSONDecodeError, AttributeError, TypeError, KeyError):
+                                        # Malformed trailing SSE frame - skip it
+                                        continue
                     break
         finally:
             self.active_queues.pop(req_id, None)
@@ -587,14 +607,14 @@ class BrowserBridgeEngine:
 # Engine 2: curl_cffi zero-browser fallback (Async non-blocking)
 # ---------------------------------------------------------------------------
 class CurlEngine:
-    def __init__(self, proxy: Optional[str] = None, pool_size: int = 5):
+    def __init__(self, proxy: str | None = None, pool_size: int = 5):
         from curl_cffi import requests as cr
         self.requests = cr
         self.proxy = proxy
-        self.proxies = {"http": proxy, "https": proxy} if proxy else None
+        self.proxies: Any = {"http": proxy, "https": proxy} if proxy else None
         self.pool_size = max(1, pool_size)
         self.session = cr.AsyncSession(impersonate="chrome120", proxies=self.proxies)
-        self.token_pool: List[Tuple[str, float]] = []
+        self.token_pool: list[tuple[str, float]] = []
         self._token_lock = asyncio.Lock()
         self._rr_index = 0
 
@@ -636,7 +656,7 @@ class CurlEngine:
             except Exception as e:
                 print(f"[Curl] Error closing session: {e}")
 
-    async def _fetch_single_token(self) -> Tuple[str, float]:
+    async def _fetch_single_token(self) -> tuple[str, float]:
         r = await self.session.get(
             "https://chat.inceptionlabs.ai/api/session",
             timeout=15,
@@ -701,13 +721,15 @@ class CurlEngine:
                             title = ev.get("title", "")
                             if url and url != "__searching__":
                                 yield ("citation", {"url": url, "title": title})
-                    except Exception:
-                        pass
+                    except (json.JSONDecodeError, AttributeError, TypeError, KeyError):
+                        # Malformed SSE frame from upstream - skip it, keep stream alive
+                        continue
 
 
 # ---------------------------------------------------------------------------
 # Engine selection
 # ---------------------------------------------------------------------------
+engine: Any
 if ENGINE == "browser":
     print(f"[*] Engine: Playwright headless browser bridge (Pool size: {POOL_SIZE})")
     engine = BrowserBridgeEngine(proxy=PROXY_URL, chrome_path=CHROME_PATH, pool_size=POOL_SIZE)
@@ -739,7 +761,7 @@ async def chat_events_with_retry(messages, reasoning_effort: str = "medium", web
     tokens (401/403) are refreshed before each retry.
     """
     attempts = UPSTREAM_RETRIES + 1
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
 
     for attempt in range(attempts):
         emitted = False
@@ -766,7 +788,7 @@ async def chat_events_with_retry(messages, reasoning_effort: str = "medium", web
         raise last_err
 
 
-def verify_auth(auth_header: Optional[str] = Header(None)):
+def verify_auth(auth_header: str | None = Header(None)):
     if API_KEY:
         if not auth_header or not auth_header.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Missing or invalid Bearer token")
@@ -821,9 +843,9 @@ async def health():
 # Tool Emulation Helpers (Function Calling virtualization)
 # ---------------------------------------------------------------------------
 def parse_tool_definitions(
-    tools: Optional[List[Dict[str, Any]]],
-    functions: Optional[List[Dict[str, Any]]] = None
-) -> Tuple[List[Dict[str, Any]], List[str]]:
+    tools: list[dict[str, Any]] | None,
+    functions: list[dict[str, Any]] | None = None
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Normalizes OpenAI tools/functions definitions into a unified format."""
     tool_defs = []
     valid_names = []
@@ -850,7 +872,7 @@ def parse_tool_definitions(
     return tool_defs, valid_names
 
 
-def extract_balanced_json(s: str, start_index: int = 0) -> Optional[Tuple[str, int, int]]:
+def extract_balanced_json(s: str, start_index: int = 0) -> tuple[str, int, int] | None:
     """
     Finds the first balanced {...} or [...] starting at or after start_index.
     Handles quotes and escaping correctly.
@@ -901,7 +923,7 @@ def extract_balanced_json(s: str, start_index: int = 0) -> Optional[Tuple[str, i
     return None
 
 
-def compact_tool_definitions(tool_defs: List[Dict[str, Any]], max_tools: int = 50) -> List[Dict[str, Any]]:
+def compact_tool_definitions(tool_defs: list[dict[str, Any]], max_tools: int = 50) -> list[dict[str, Any]]:
     """
     Compacts tool definitions to keep prompt size manageable:
     - Truncates verbose descriptions (> 100 chars).
@@ -938,7 +960,7 @@ def compact_tool_definitions(tool_defs: List[Dict[str, Any]], max_tools: int = 5
     return compacted
 
 
-def build_tool_system_prompt(tool_defs: List[Dict[str, Any]], tool_choice: Any = "auto") -> str:
+def build_tool_system_prompt(tool_defs: list[dict[str, Any]], tool_choice: Any = "auto") -> str:
     """Builds a compact, unambiguous system prompt instructing the model how to call tools."""
     compacted_defs = compact_tool_definitions(tool_defs)
     tools_json = json.dumps(compacted_defs, ensure_ascii=False, separators=(',', ':'))
@@ -968,9 +990,9 @@ def build_tool_system_prompt(tool_defs: List[Dict[str, Any]], tool_choice: Any =
 
 
 def prepare_messages_for_tools(
-    messages: List[Dict[str, Any]],
-    tool_prompt: Optional[str] = None
-) -> List[Dict[str, Any]]:
+    messages: list[dict[str, Any]],
+    tool_prompt: str | None = None
+) -> list[dict[str, Any]]:
     """Appends tool_prompt to messages as a system message if provided."""
     copied = list(messages)
     if tool_prompt:
@@ -978,7 +1000,7 @@ def prepare_messages_for_tools(
     return copied
 
 
-def remove_spans(text: str, spans: List[Tuple[int, int]]) -> str:
+def remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
     """Removes a list of non-overlapping [start, end) spans from text, preserving other segments."""
     if not spans:
         return text
@@ -996,8 +1018,8 @@ def remove_spans(text: str, spans: List[Tuple[int, int]]) -> str:
 
 def extract_tool_calls(
     text: str,
-    valid_tool_names: List[str]
-) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    valid_tool_names: list[str]
+) -> tuple[list[dict[str, Any]] | None, str]:
     """Extracts tool calls from model output with multi-pattern tolerance:
     1. Natural calling syntax (e.g. Calling tool `todo` with arguments: {...})
     2. Action / Tool Call syntax (e.g. Tool Call: todo Arguments: {...})
@@ -1054,7 +1076,8 @@ def extract_tool_calls(
         snippet = match.group(1).strip()
         try:
             parsed = json.loads(snippet)
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
+            # Not a JSON payload (e.g. prose in a plain fenced block) - skip it
             continue
 
         items = parsed if isinstance(parsed, list) else [parsed]
@@ -1108,7 +1131,8 @@ def extract_tool_calls(
         pos = b_end
         try:
             parsed = json.loads(json_str)
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
+            # Brace-balanced but not valid JSON - skip it
             continue
 
         items = parsed if isinstance(parsed, list) else [parsed]
@@ -1178,8 +1202,8 @@ async def chat_completions(request: Request):
 
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
 
     messages = body.get("messages", [])
     model = body.get("model", DEFAULT_MODEL)
@@ -1392,11 +1416,12 @@ async def chat_completions(request: Request):
                 elif kind == "citation":
                     citations.append(val)
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Upstream chat error: {str(e)}")
+            raise HTTPException(status_code=502, detail=f"Upstream chat error: {str(e)}") from e
 
         merged_text = "".join(full_text)
         tool_calls = None
         finish_reason = "stop"
+        msg_payload: dict[str, Any]
 
         if has_tools:
             tool_calls, remaining_content = extract_tool_calls(merged_text, valid_tool_names)
