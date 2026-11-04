@@ -141,6 +141,11 @@ systemctl enable --now inception-api
 | `DEFAULT_REASONING_EFFORT` | `medium` | 全局默认思考深度：`instant`（零思考极速）、`low`、`medium`、`high`。方便不支持传参的客户端全局免思考 |
 | `DEFAULT_MODEL` | `mercury-3` | 默认模型名称 |
 | `CHROME_PATH` | 自动探测 | Chromium 可执行文件路径（默认自动探测 `/usr/bin/chromium` 等） |
+| `MAX_MSG_CHARS` | `1400000` | 单条 message 字符硬上限（防上游 413）。超过则保留前一半 + 后一半，中间插 truncation 标记。`0` 表示不按字符截断。旧版硬编码 12000，长上下文会被静默腰斩 |
+| `MAX_INPUT_TOKENS` | `950000` | 单条 message 的**估算 token** 上限（这才是真正的上下文预算）。中文按 1 字≈1 token、其他按 4 字符≈1 token 估算。实测上游约 1M token：99 万中文字符 5/5 召回（16s）；>1.0M token 时尾部（含最后的提问）被上游静默丢弃；1.4M~1.6M 字符直接 413。`0` 表示不按 token 截断 |
+| `UPSTREAM_RETRIES` | `2` | 上游失败重试次数。仅在**首个 token 之前**重试（中途重试会导致内容重复），每次重试前强制刷新会话 token；413/400 这类确定性错误不重试 |
+| `FIRST_TOKEN_TIMEOUT` | `180` | 等首个 token 的超时秒数，超时即报错（旧版无限等待，上游卡住时请求会永久挂着） |
+| `STREAM_IDLE_TIMEOUT` | `120` | 流式过程中两个 chunk 之间的最大间隔秒数 |
 
 ---
 

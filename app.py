@@ -45,6 +45,31 @@ except ValueError:
 
 DEFAULT_REASONING_EFFORT = os.getenv("DEFAULT_REASONING_EFFORT", "medium").strip().lower()
 
+try:
+    MAX_MSG_CHARS = int(os.getenv("MAX_MSG_CHARS", "1400000"))
+except ValueError:
+    MAX_MSG_CHARS = 1400000
+
+try:
+    MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "950000"))
+except ValueError:
+    MAX_INPUT_TOKENS = 950000
+
+try:
+    UPSTREAM_RETRIES = max(0, int(os.getenv("UPSTREAM_RETRIES", "2")))
+except ValueError:
+    UPSTREAM_RETRIES = 2
+
+try:
+    FIRST_TOKEN_TIMEOUT = float(os.getenv("FIRST_TOKEN_TIMEOUT", "180"))
+except ValueError:
+    FIRST_TOKEN_TIMEOUT = 180.0
+
+try:
+    STREAM_IDLE_TIMEOUT = float(os.getenv("STREAM_IDLE_TIMEOUT", "120"))
+except ValueError:
+    STREAM_IDLE_TIMEOUT = 120.0
+
 app = FastAPI(
     title="Inception Mercury Web-to-API",
     description="Headless browser bridge with OpenAI-compatible API for Inception Mercury 3",
@@ -78,7 +103,43 @@ def current_timestamp() -> int:
 # ---------------------------------------------------------------------------
 # Upstream Payload Normalization (Vercel AI SDK compatibility)
 # ---------------------------------------------------------------------------
-def normalize_upstream_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: CJK chars ~= 1 token each, other text ~= 4 chars per token."""
+    if not text:
+        return 0
+    cjk = 0
+    for ch in text:
+        code = ord(ch)
+        if 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF or 0x3040 <= code <= 0x30FF:
+            cjk += 1
+    other = len(text) - cjk
+    return cjk + (other + 3) // 4
+
+
+def fit_content(content_str: str) -> str:
+    """Clamp a single message so it fits both the character and token budgets.
+
+    The upstream web endpoint silently drops everything past ~1M tokens (including
+    the trailing user question) and rejects payloads around 1.4M-1.6M chars with
+    HTTP 413, so we keep the head and the tail and mark the elided middle.
+    """
+    limit_chars = MAX_MSG_CHARS if MAX_MSG_CHARS > 0 else None
+
+    if MAX_INPUT_TOKENS > 0:
+        est = estimate_tokens(content_str)
+        if est > MAX_INPUT_TOKENS:
+            allowed = int(len(content_str) * MAX_INPUT_TOKENS / est)
+            limit_chars = allowed if limit_chars is None else min(limit_chars, allowed)
+
+    if limit_chars is not None and len(content_str) > limit_chars:
+        half = max(1, limit_chars // 2)
+        return (content_str[:half]
+                + "\n\n...[content truncated to preserve context window]...\n\n"
+                + content_str[-half:])
+    return content_str
+
+
+def normalize_upstream_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """
     Normalizes OpenAI messages array strictly for Inception Web API (/api/chat):
     - Upstream only supports 'user' and 'assistant' roles (Vercel AI SDK useChat).
@@ -145,9 +206,8 @@ def normalize_upstream_messages(messages: List[Dict[str, Any]]) -> List[Dict[str
     coalesced = []
     for msg in cleaned_messages:
         content_str = str(msg.get("content", ""))
-        # Truncate single message if abnormally huge (> 12000 chars) to prevent context blowup
-        if len(content_str) > 12000:
-            content_str = content_str[:6000] + "\n\n...[content truncated to preserve context window]...\n\n" + content_str[-6000:]
+        # Clamp oversized messages against both the char and token budgets
+        content_str = fit_content(content_str)
 
         if coalesced and coalesced[-1]["role"] == msg["role"]:
             coalesced[-1]["content"] = f"{coalesced[-1]['content']}\n\n{content_str}"
@@ -456,11 +516,20 @@ class BrowserBridgeEngine:
 
         try:
             buffer = ""
+            got_first = False
             while True:
                 # read from local queue; the browser loop writes into it
-                item = await queue.get()
+                timeout = STREAM_IDLE_TIMEOUT if got_first else FIRST_TOKEN_TIMEOUT
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    stage = "idle" if got_first else "first token"
+                    raise RuntimeError(
+                        f"Upstream stream timeout ({stage} > {timeout:.0f}s); browser bridge stopped responding"
+                    )
                 kind = item[0]
                 if kind == "chunk":
+                    got_first = True
                     buffer += item[1]
                     while "\n\n" in buffer:
                         event_block, buffer = buffer.split("\n\n", 1)
@@ -650,6 +719,53 @@ else:
     raise SystemExit(f"Unknown ENGINE={ENGINE}; use browser or curl")
 
 
+# ---------------------------------------------------------------------------
+# Upstream call with bounded retry (safe only before the first token is emitted)
+# ---------------------------------------------------------------------------
+# 413 / 400 are deterministic: retrying the same payload cannot help.
+NON_RETRYABLE_MARKERS = ("413", "Request Entity Too Large", "FUNCTION_PAYLOAD_TOO_LARGE", "400")
+
+
+def _is_retryable(err: Exception) -> bool:
+    text = str(err)
+    return not any(marker in text for marker in NON_RETRYABLE_MARKERS)
+
+
+async def chat_events_with_retry(messages, reasoning_effort: str = "medium", web_search: bool = False):
+    """Wrap engine.chat_events with bounded retries while nothing has been emitted yet.
+
+    Once the first token reaches the client a retry would duplicate content, so
+    mid-stream failures propagate to the caller instead. Expired/rejected session
+    tokens (401/403) are refreshed before each retry.
+    """
+    attempts = UPSTREAM_RETRIES + 1
+    last_err: Optional[Exception] = None
+
+    for attempt in range(attempts):
+        emitted = False
+        try:
+            async for kind, val in engine.chat_events(
+                messages, reasoning_effort=reasoning_effort, web_search=web_search
+            ):
+                emitted = True
+                yield kind, val
+            return
+        except Exception as e:
+            last_err = e
+            if emitted or not _is_retryable(e) or attempt == attempts - 1:
+                raise
+            delay = min(2 ** attempt, 4)
+            print(f"[Retry] attempt {attempt + 1}/{attempts} failed before first token ({e}); retrying in {delay}s", flush=True)
+            await asyncio.sleep(delay)
+            try:
+                await engine.get_token(force_refresh=True)
+            except Exception as token_err:
+                print(f"[Retry] token refresh failed: {token_err}", flush=True)
+
+    if last_err is not None:
+        raise last_err
+
+
 def verify_auth(auth_header: Optional[str] = Header(None)):
     if API_KEY:
         if not auth_header or not auth_header.startswith("Bearer "):
@@ -690,6 +806,11 @@ async def health():
         "service": "inception-web-api",
         "engine": ENGINE,
         "pool_size": POOL_SIZE,
+        "max_msg_chars": MAX_MSG_CHARS,
+        "max_input_tokens": MAX_INPUT_TOKENS,
+        "upstream_retries": UPSTREAM_RETRIES,
+        "first_token_timeout": FIRST_TOKEN_TIMEOUT,
+        "stream_idle_timeout": STREAM_IDLE_TIMEOUT,
         "active_tokens": len(getattr(engine, "token_pool", [])),
         "proxy": PROXY_URL is not None,
         "browser_ready": engine._ready.is_set() if ENGINE == "browser" else True,
@@ -1096,7 +1217,7 @@ async def chat_completions(request: Request):
     # Generator for raw real-time streaming when no tools are requested
     async def real_time_stream_generator():
         try:
-            async for kind, val in engine.chat_events(
+            async for kind, val in chat_events_with_retry(
                 effective_messages,
                 reasoning_effort=reasoning_effort,
                 web_search=web_search,
@@ -1147,7 +1268,7 @@ async def chat_completions(request: Request):
 
         full_text = []
         try:
-            async for kind, val in engine.chat_events(
+            async for kind, val in chat_events_with_retry(
                 effective_messages,
                 reasoning_effort=reasoning_effort,
                 web_search=web_search,
@@ -1259,7 +1380,7 @@ async def chat_completions(request: Request):
         full_reasoning = []
         citations = []
         try:
-            async for kind, val in engine.chat_events(
+            async for kind, val in chat_events_with_retry(
                 effective_messages,
                 reasoning_effort=reasoning_effort,
                 web_search=web_search,
@@ -1309,9 +1430,13 @@ async def chat_completions(request: Request):
                 }
             ],
             "usage": {
-                "prompt_tokens": len(str(messages)),
-                "completion_tokens": len(merged_text),
-                "total_tokens": len(str(messages)) + len(merged_text),
+                "prompt_tokens": estimate_tokens(
+                    "".join(str(m.get("content", "")) for m in effective_messages)
+                ),
+                "completion_tokens": estimate_tokens(merged_text),
+                "total_tokens": estimate_tokens(
+                    "".join(str(m.get("content", "")) for m in effective_messages)
+                ) + estimate_tokens(merged_text),
             },
         }
 
