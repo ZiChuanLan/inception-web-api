@@ -141,13 +141,26 @@ def normalize_upstream_messages(messages: List[Dict[str, Any]]) -> List[Dict[str
             # If no user message was present, create one with the system prompt
             cleaned_messages.insert(0, {"role": "user", "content": merged_system})
 
-    # Ensure there is at least one message and the last message is 'user'
-    if not cleaned_messages:
-        cleaned_messages.append({"role": "user", "content": "Hello"})
-    elif cleaned_messages[-1]["role"] != "user":
-        cleaned_messages.append({"role": "user", "content": "Please continue."})
+    # Coalesce consecutive messages of the same role (Vercel AI SDK strictly requires alternating user/assistant)
+    coalesced = []
+    for msg in cleaned_messages:
+        content_str = str(msg.get("content", ""))
+        # Truncate single message if abnormally huge (> 12000 chars) to prevent context blowup
+        if len(content_str) > 12000:
+            content_str = content_str[:6000] + "\n\n...[content truncated to preserve context window]...\n\n" + content_str[-6000:]
 
-    return cleaned_messages
+        if coalesced and coalesced[-1]["role"] == msg["role"]:
+            coalesced[-1]["content"] = f"{coalesced[-1]['content']}\n\n{content_str}"
+        else:
+            coalesced.append({"role": msg["role"], "content": content_str})
+
+    # Ensure there is at least one message and the last message is 'user'
+    if not coalesced:
+        coalesced.append({"role": "user", "content": "Hello"})
+    elif coalesced[-1]["role"] != "user":
+        coalesced.append({"role": "user", "content": "Please continue."})
+
+    return coalesced
 
 
 def build_upstream_payload(
@@ -1124,9 +1137,15 @@ async def chat_completions(request: Request):
 
     # Generator for tool-emulated streaming
     async def tool_stream_generator():
+        # 1. Send initial role chunk immediately so client / proxy (MG) does not timeout
+        init_chunk = {
+            "id": req_id, "object": "chat.completion.chunk",
+            "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(init_chunk, ensure_ascii=False)}\n\n"
+
         full_text = []
-        full_reasoning = []
-        citations = []
         try:
             async for kind, val in engine.chat_events(
                 effective_messages,
@@ -1136,43 +1155,34 @@ async def chat_completions(request: Request):
                 if kind == "text":
                     full_text.append(val)
                 elif kind == "reasoning":
-                    full_reasoning.append(val)
+                    # Stream reasoning content in real-time! Keep connection active & show thinking
+                    r_chunk = {
+                        "id": req_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(r_chunk, ensure_ascii=False)}\n\n"
                 elif kind == "citation":
-                    citations.append(val)
+                    c_chunk = {
+                        "id": req_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"citation": val}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(c_chunk, ensure_ascii=False)}\n\n"
         except Exception as e:
-            err_chunk = {"error": str(e)}
+            err_msg = f"[Upstream Error]: {str(e)}"
+            err_chunk = {
+                "id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": err_msg}, "finish_reason": "stop"}],
+            }
             yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
             return
 
         # Check for tool call in output
         merged_text = "".join(full_text)
         tool_calls, remaining_content = extract_tool_calls(merged_text, valid_tool_names)
-
-        # 1. Output reasoning content first if present
-        if full_reasoning:
-            merged_reasoning = "".join(full_reasoning)
-            chunk = {
-                "id": req_id, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": merged_reasoning}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        else:
-            role_chunk = {
-                "id": req_id, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
-
-        # 2. Output citations if present
-        for cit in citations:
-            chunk = {
-                "id": req_id, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {"citation": cit}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         if tool_calls:
             if remaining_content:
